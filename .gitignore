@@ -1,4 +1,5 @@
 /build/
+/.backups/
 /.toolchains/
 /firmware/rootfs-overlay/root/.ssh/
 *.pem

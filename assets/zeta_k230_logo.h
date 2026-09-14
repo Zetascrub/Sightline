@@ -1,6 +1,6 @@
 // Mascot artwork - not MIT-licensed, see LICENSE in this directory and
 // ../../../ARTWORK_LICENSE.md. Generated from
-// /mnt/Storage/Coding/Misc/Mascot/Zeta_Mascot_Headshot_transparent.png via
+// the canonical Zeta mascot headshot in the maintainer artwork workspace via
 // LVGL's own scripts/LVGLImage.py (ARGB8888, 56x56 - sized for the status
 // bar icon, not a full-screen asset).
 #pragma once

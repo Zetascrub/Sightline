@@ -1,6 +1,25 @@
+<div align="center">
+
+<img src="assets/zeta.png" alt="Zeta, the Reconclave mascot" width="140">
+
 # Sightline
 
+### See the edge. Understand the scene. Share the signal.
+
+[![Hardware](https://img.shields.io/badge/hardware-T--Display_K230-0e222e?style=flat-square)](#hardware-and-implementation-status)
+[![Build](https://img.shields.io/badge/build-CMake_%2B_Buildroot-00cdd7?style=flat-square)](#build-once-the-toolchain-is-on-path)
+[![Status](https://img.shields.io/badge/status-hardware_preview-ffaa1c?style=flat-square)](#hardware-and-implementation-status)
+[![Family](https://img.shields.io/badge/family-Reconclave-fff2d7?style=flat-square)](https://github.com/Zetascrub/Reconclave)
+
 **The vision, positioning, and edge-analysis node for the Reconclave family.**
+
+[Reconclave](https://github.com/Zetascrub/Reconclave) ·
+[ZetaDongle](https://github.com/Zetascrub/ZetaDongle) ·
+[FieldDeck](https://github.com/Zetascrub/FieldDeck) ·
+[Relay](https://github.com/Zetascrub/Relay) ·
+[Command](https://github.com/Zetascrub/Reconclave-Command)
+
+</div>
 
 Sightline targets the LILYGO T-Display K230. It operates as a standalone visual
 field instrument and as a capability-advertising Reconclave node, contributing
@@ -287,7 +306,7 @@ on the device's existing rootfs.
 
 ## Boot splash — paused, unresolved, needs serial console to continue
 
-Wanted: custom branded art (`/mnt/Storage/Coding/Misc/Mascot/`, not in this
+Wanted: custom branded art (from the maintainer's private mascot workspace, not in this
 repo) shown during boot, before Linux/our app are running. Two real fixes
 were applied and verified correct against source; the splash still doesn't
 show. Documenting the full path here so this doesn't need re-deriving.
@@ -369,9 +388,9 @@ offsets on-device first and found the literal `K230` magic at both,
 confirming the offsets are correct for this device's actual layout, not
 just the build's assumption. **Three independent recovery layers** were
 established/confirmed before flashing anything: (1) the full SD card
-image backup (`/mnt/Storage/k230-sdcard-backup-*.img.gz`, from early in
+image backup (stored outside the repository, from early in
 this project), (2) a fresh raw-region backup of just the first 30MB
-(`/mnt/Storage/k230-uboot-region-backup-*.img.gz`, covers both bootloader
+(a separate boot-region backup, covering both bootloader
 stages), (3) the K230 SoC's own boot ROM automatically falls into a USB
 recovery/burning mode if it fails to boot from storage at all (confirmed
 via the official Kendryte docs, independent of anything on the SD card -
@@ -499,7 +518,7 @@ until this is revisited.
 ## Driver parity check against the stock firmware backup
 
 To check whether the custom firmware rebuild was missing any drivers, the
-full stock SD card backup (`/mnt/Storage/k230-sdcard-backup-*.img.gz`,
+full stock SD card backup (stored outside the repository,
 ~15.6GB uncompressed) was decompressed and its two partitions extracted
 with `dd` (boot: sectors 61440-225279; rootfs: sectors 262144-30468750,
 from the stock image's own partition table), then mounted read-only with

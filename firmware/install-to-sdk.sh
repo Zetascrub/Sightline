@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SDK_DIR="${1:-}"
 DEFCONFIG="${2:-k230_canmv_t_display_rm69a10_defconfig}"
-MASCOT_DIR="${RECONCLAVE_MASCOT_DIR:-/mnt/Storage/Coding/Misc/Mascot}"
+MASCOT_DIR="${RECONCLAVE_MASCOT_DIR:-$PROJECT_DIR/assets}"
 
 if [[ -z "$SDK_DIR" || ! -f "$SDK_DIR/Makefile" ]]; then
 	echo "Usage: $0 /path/to/k230_linux_sdk [defconfig]" >&2
@@ -58,7 +58,7 @@ OVERLAY_SSH="$SCRIPT_DIR/rootfs-overlay/root/.ssh"
 if [[ ! -s "$OVERLAY_SSH/authorized_keys" ]]; then
 	echo "Missing $OVERLAY_SSH/authorized_keys" >&2
 	echo "This image uses key-only root login; a build without it would lock you out." >&2
-	echo "Copy devices/k230/firmware/ssh/authorized_keys.example there and add your public key(s)." >&2
+	echo "Copy firmware/ssh/authorized_keys.example there and add your public key(s)." >&2
 	exit 1
 fi
 install -D -m 0600 "$OVERLAY_SSH/authorized_keys" "$ROOTFS_DIR/root/.ssh/authorized_keys"

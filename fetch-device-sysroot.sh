@@ -4,17 +4,17 @@
 # UI targets link against the K230's *actual* on-device liblvgl.so/libdrm.so
 # rather than a self-built LVGL, since the stock image already ships a
 # proven, working combination (k230_phone_ui uses it) - see
-# devices/k230/README.md. This script pulls those .so files plus matching
+# README.md. This script pulls those .so files plus matching
 # upstream headers, so a caller only needs to re-run it, not follow a
 # multi-step manual recipe.
 #
-# Usage: devices/k230/fetch-device-sysroot.sh [device-ssh-host]
-# Default device-ssh-host is root@192.168.8.134 (this project's bench unit).
+# Usage: ./fetch-device-sysroot.sh [device-ssh-host]
+# Default device-ssh-host is root@sightline.local.
 
 set -e
 
-DEVICE="${1:-root@192.168.8.134}"
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+DEVICE="${1:-root@sightline.local}"
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SYSROOT="$ROOT_DIR/.toolchains/device-sysroot"
 LVGL_SRC="$ROOT_DIR/.toolchains/lvgl-src"
 LIBDRM_SRC="$ROOT_DIR/.toolchains/libdrm-src"

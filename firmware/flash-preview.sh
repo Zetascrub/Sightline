@@ -3,9 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ROOTFS=/run/media/tom/rootfs
-BOOT=/run/media/tom/boot
-DEVICE=/dev/sda
+ROOTFS="${SIGHTLINE_ROOTFS:-/run/media/${SUDO_USER:-$USER}/rootfs}"
+BOOT="${SIGHTLINE_BOOT:-/run/media/${SUDO_USER:-$USER}/boot}"
+DEVICE="${SIGHTLINE_DEVICE:-/dev/sda}"
+BACKUP_DIR="${SIGHTLINE_BACKUP_DIR:-$PROJECT_DIR/.backups}"
 ROOTFS_UUID=c2ec81a4-cccd-4101-a680-552268f17a76
 BOOT_UUID=e883b06a-6fa1-437d-8ed9-e90c24fbdc90
 
@@ -31,7 +32,8 @@ NODE="$PROJECT_DIR/build/reconclave_k230"
 }
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
-backup="/mnt/Storage/k230-reconclave-preview-backup-$stamp.tar.gz"
+install -d -m 0700 "$BACKUP_DIR"
+backup="$BACKUP_DIR/k230-reconclave-preview-backup-$stamp.tar.gz"
 paths=()
 for path in \
 	etc/init.d/S90reconclave \
@@ -54,7 +56,7 @@ done
 tar -C "$ROOTFS" -czf "$backup" "${paths[@]}"
 echo "Backup: $backup"
 if [[ -f "$BOOT/logo.xrgb" ]]; then
-	cp -a "$BOOT/logo.xrgb" "/mnt/Storage/k230-logo-pre-preview-$stamp.xrgb"
+	cp -a "$BOOT/logo.xrgb" "$BACKUP_DIR/k230-logo-pre-preview-$stamp.xrgb"
 fi
 
 install -D -m 0755 "$NODE" "$ROOTFS/usr/bin/reconclave-k230-node"
