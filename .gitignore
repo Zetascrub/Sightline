@@ -1,0 +1,7 @@
+/build/
+/.toolchains/
+/firmware/rootfs-overlay/root/.ssh/
+*.pem
+*.key
+*.log
+.DS_Store

@@ -1,0 +1,14 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: cmake -S . -B build
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
