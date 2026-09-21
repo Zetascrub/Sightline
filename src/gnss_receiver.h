@@ -2,22 +2,12 @@
 
 #include <string>
 
+#include "gnss_nmea.h"
+
+struct gpiod_chip;
+struct gpiod_line_request;
+
 namespace reconclave {
-
-struct GnssFix {
-  bool valid = false;
-  double latitude = 0.0;
-  double longitude = 0.0;
-  double altitude_m = 0.0;
-  double speed_knots = 0.0;
-  int satellites = 0;
-  std::string utc;
-  std::string last_sentence;
-};
-
-// Parses a checksum-valid GGA or RMC sentence. Other valid NMEA messages are
-// accepted but do not change the fix.
-bool parseNmeaSentence(const std::string& sentence, GnssFix& fix);
 
 class GnssReceiver {
  public:
@@ -45,6 +35,8 @@ class GnssReceiver {
   std::string api_info_;
   unsigned nmea_count_ = 0;
   GnssFix fix_;
+  gpiod_chip* enable_chip_ = nullptr;
+  gpiod_line_request* enable_request_ = nullptr;
 };
 
 }  // namespace reconclave

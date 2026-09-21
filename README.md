@@ -322,9 +322,32 @@ on the device's existing rootfs.
 7. **Perception.** Camera capture, OCR, object detection via the vendor KPU
    runtime. `/dev/video0`-`video4` plus dedicated ISP/VPU device nodes
    confirmed present.
-8. **BLE — currently broken on this image.** `aic_btusb` driver loads but
-   registers zero HCI controllers (`bluetoothd`: "Number of controllers:
-   0"). Needs further driver-level investigation before it's portable.
+8. **BLE — still broken, narrowed down further but not resolved.**
+   `aic_btusb` loads (confirmed via dmesg: registers as a USB interface
+   driver, version 2.1.0), but the AIC8800's Bluetooth-over-USB endpoint
+   never appears anywhere on `/sys/bus/usb/devices` - not as an operational
+   device, and not even at the intermediate "boot ROM" USB PID
+   (`a69c:8d80`) that public documentation for this same chip family
+   describes `aic_load_fw` uploading combined WiFi+BT firmware to before
+   the chip re-enumerates as its final PID. That upload never happens here
+   at all: `aic_load_fw` is loaded but its only holder is `aic8800_fdrv`
+   (confirmed via `/sys/module/aic_load_fw/holders/`), which is this
+   board's WiFi driver, talking over SDIO, not USB - `aic_btusb` never
+   triggers any firmware load of its own, it just waits passively for a
+   USB device that never shows up. One of the two DWC OTG USB controllers
+   (`91500000.usb`, bus 1) has zero devices attached at all, not even the
+   boot-ROM stage - both controllers log "supply vusb_d/vusb_a not found,
+   using dummy regulator" at boot, meaning no real VBUS regulator/enable
+   GPIO is wired up in the devicetree for either bus, so if AIC8800 BT
+   needs one, nothing in this image's boot sequence would toggle it. This
+   matches the general shape of GNSS's real root cause (an unwired enable
+   step, not a firmware/driver defect) closely enough to be a real lead,
+   but unlike GNSS's documented `GPIO2`, there's no equivalent pointer
+   anywhere found for BT - probing GPIO lines by trial and error without
+   schematics wasn't judged worth the risk. Needs either vendor
+   engineering docs or a serial console capturing the AIC8800's own boot
+   messages (same underlying gap as the boot-splash work above) to make
+   further progress without guessing.
 9. **Trust bootstrap - device side done, fleet-tool side still open.** A
    64-character hex execution key generated on-device from `/dev/urandom`
    and written to `/root/reconclave/trust/execution.key` (the path
@@ -793,6 +816,78 @@ screen loads (the first object added to a freshly-emptied group is
 auto-focused - confirmed by reading `lv_group_add_obj()`'s source, not
 assumed), and arrow keys move it between real tiles/buttons.
 
+## GNSS: the modem was just never powered on
+
+`ui_app.cpp` had a `constexpr bool kGnssAvailable = false;` with a comment
+claiming "the shipped modem firmware does not currently accept the GNSS
+configuration required by Reconclave" - this was wrong, and the mechanism
+behind that wrong diagnosis is worth recording. Manually opening
+`/dev/ttyS3` and sending plain `AT` got **zero bytes back**, which reads
+identically to "this firmware doesn't understand our commands" and to "this
+UART is connected to nothing powered on" - the two look the same from the
+serial port alone, and whoever wrote that comment reasonably picked the
+firmware explanation without another way to distinguish them.
+
+The actual cause: this device's nRF9151 has a dedicated enable line - the
+milestone-4 note above already documented it as "GPIO2", but nothing in
+this codebase ever drove it. Global GPIO2 is gpiochip0 line 2 (line < 32,
+so chip0 - see `tca8418_keyboard.h`'s numbering note). Confirmed by hand
+first, safely, before touching any code: `gpioset -c gpiochip0 -C
+reconclave-gnss-enable 2=1` held in the background, then the exact same
+`AT` command that had gone completely unanswered got `OK` back within
+~2 seconds. Every AT command the existing `GnssReceiver::start()` sends,
+replayed by hand in the same order with the line held high, succeeded all
+the way through `AT+CFUN=31` (GNSS-only mode) and `AT#XGPS=1,0,0,0`
+(legacy GPS start) - this modem's firmware (`mfw_nrf91x1_2.0.3`) simply
+doesn't support the *modern* `#XGNSS` API (`AT#XGNSS=?` returns `ERROR`),
+which `start()` already correctly detects and falls back from; the legacy
+`#XGPS` API it does support (`AT#XGPS=?` returns a real capability
+string) was never actually reached in previous attempts because the modem
+was never on to reach in the first place.
+
+Fixed in `GnssReceiver::start()`/`stop()` (`src/gnss_receiver.cpp`): drives
+gpiochip0 line 2 high via libgpiod before opening the UART (300ms settle
+delay, cheap insurance ahead of the first exchange, which itself already
+retries for 1500ms), releases it on `stop()`. `kGnssAvailable` is now
+`true`.
+
+**A second, independently-confirmed bug found while verifying this**:
+`processLine()`'s position-fix parser looked for a `"#XGPSPOS:"` prefix,
+which this (or probably any) nRF91 Serial LTE Modem build never actually
+sends - confirmed against Nordic's own documented format, `#XGPS:
+<latitude>,<longitude>,<altitude>,<accuracy>,<speed>,<heading>,<datetime>`,
+and against this modem's real synchronous status line observed during
+testing (`#XGPS: 1,1`). The same `"#XGPS:"` prefix is used for both that
+2-field status echo and a real 7-field fix notification; the existing
+`fields.size() >= 7` check already correctly told them apart once the
+prefix itself was fixed to match. The modern API's `"#XGNSSPOS:"` prefix
+is left unverified and unchanged, since this modem can't exercise that
+path at all to confirm or deny it against.
+
+**What's confirmed and what isn't**: every AT command in the real start
+sequence, replayed by hand in the exact order the code uses, succeeded
+end-to-end through starting legacy GPS. No position report arrived in a
+20-second window, indoors, which is the expected outcome for GPS with no
+sky visibility, not a failure signal. Cross-compiled, deployed, and
+smoke-tested `reconclave_k230_ui` with this change - starts and runs
+cleanly. What's *not* confirmed: an actual live fix flowing through the
+real C++ code's parser (as opposed to my manual byte-for-byte replay of
+the protocol), since that needs either open sky or a much longer indoor
+window than was tested, and pressing the on-screen "Start GNSS" button is
+a physical/UI step, not something drivable over SSH.
+
+`src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
+coordinate helpers were split out of `gnss_receiver.cpp` into their own
+files with no libgpiod dependency. This wasn't a style preference - once
+`gnss_receiver.cpp` needed `<gpiod.h>` for the enable-line fix, it stopped
+being buildable for `reconclave_k230` (the headless node binary, which
+compiled this file for `parseNmeaSentence`'s tests even though `main.cpp`
+never actually references GNSS at all) and `sightline_recon_tests` (the
+host test target, no libgpiod available on the host either). `main.cpp`'s
+disuse of GNSS meant `reconclave_k230` no longer needed either new file at
+all; the test target and `reconclave_k230_ui` link `gnss_nmea.cpp`, and
+only `reconclave_k230_ui` also links `gnss_receiver.cpp`.
+
 ## Device sysroot: the correct `lv_conf.h` recipe
 
 `fetch-device-sysroot.sh` previously fetched
@@ -852,7 +947,7 @@ against real K230 hardware rather than assumed:
 | BLE discovery | Blocked | Driver issue, see milestone 8 above |
 | Touchscreen UI | Done | Milestone 6 - §18 mockup, landscape, touch navigation |
 | Keyboard-driven navigation | Done | See "Keyboard-driven navigation" below - this row was stale, milestone 4/6 had already wired most of it |
-| GNSS / cellular | Implemented; hardware validation pending | Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, starts LILYGO's Serial LTE Modem GNSS sequence, validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. Cellular assessment tools remain |
+| GNSS / cellular | Modem enable + legacy GPS API confirmed on real hardware; live sky fix still needs on-site testing | See "GNSS: the modem was just never powered on" below. Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, drives the modem's enable GPIO, starts the legacy `#XGPS` sequence (this firmware doesn't support the modern `#XGNSS` API), validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. Cellular assessment tools remain |
 | Assessment sessions | Done | Persistent project, engagement and operator context is editable on-device and embedded into exported observations |
 | Node/job dashboard | Done | Local UI shows trust state, node address, capability count and live remote discovery progress/findings through an atomic runtime-status channel |
 | CC1101 sub-GHz, NFC | **Not applicable** | Cardputer-specific accessory hardware; no direct K230 equivalent |

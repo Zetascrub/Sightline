@@ -1,17 +1,79 @@
 #include "gnss_receiver.h"
 
+#include <gpiod.h>
+
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
 #include <poll.h>
 
-#include <cmath>
 #include <cstdlib>
 #include <sstream>
 #include <vector>
 
 namespace reconclave {
 namespace {
+
+// The keyboard base's nRF9151 modem has a dedicated enable line - without
+// driving it, /dev/ttyS3 is completely silent (every AT command times out
+// with zero bytes received). Confirmed on real hardware: this was
+// previously misdiagnosed as "the shipped modem firmware doesn't support
+// the required GNSS configuration" (see the now-corrected comment at
+// ui_app.cpp's kGnssAvailable) - identical AT commands succeed immediately
+// once this line is driven high; the modem was simply never powered on.
+// Global GPIO2 is gpiochip0 line 2 (line < 32, so chip0 - see
+// tca8418_keyboard.h's numbering note for the two-bank K230 GPIO layout
+// this project already relies on elsewhere).
+constexpr const char* kEnableChipPath = "/dev/gpiochip0";
+constexpr unsigned kEnableOffset = 2;
+
+bool setEnableLine(gpiod_chip*& chip, gpiod_line_request*& request, bool enabled) {
+  if (request == nullptr) {
+    chip = gpiod_chip_open(kEnableChipPath);
+    if (chip == nullptr) return false;
+    gpiod_line_settings* settings = gpiod_line_settings_new();
+    gpiod_line_config* lines = gpiod_line_config_new();
+    gpiod_request_config* request_config = gpiod_request_config_new();
+    if (settings == nullptr || lines == nullptr || request_config == nullptr) {
+      if (settings != nullptr) gpiod_line_settings_free(settings);
+      if (lines != nullptr) gpiod_line_config_free(lines);
+      if (request_config != nullptr) gpiod_request_config_free(request_config);
+      gpiod_chip_close(chip);
+      chip = nullptr;
+      return false;
+    }
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(
+        settings, enabled ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE);
+    gpiod_line_config_add_line_settings(lines, &kEnableOffset, 1, settings);
+    gpiod_request_config_set_consumer(request_config, "reconclave-gnss-enable");
+    request = gpiod_chip_request_lines(chip, request_config, lines);
+    gpiod_line_settings_free(settings);
+    gpiod_line_config_free(lines);
+    gpiod_request_config_free(request_config);
+    if (request == nullptr) {
+      gpiod_chip_close(chip);
+      chip = nullptr;
+      return false;
+    }
+    return true;
+  }
+  return gpiod_line_request_set_value(
+      request, kEnableOffset,
+      enabled ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE) == 0;
+}
+
+void releaseEnableLine(gpiod_chip*& chip, gpiod_line_request*& request) {
+  if (request != nullptr) {
+    gpiod_line_request_set_value(request, kEnableOffset, GPIOD_LINE_VALUE_INACTIVE);
+    gpiod_line_request_release(request);
+    request = nullptr;
+  }
+  if (chip != nullptr) {
+    gpiod_chip_close(chip);
+    chip = nullptr;
+  }
+}
 
 std::vector<std::string> split(const std::string& value, char delimiter) {
   std::vector<std::string> fields;
@@ -21,58 +83,7 @@ std::vector<std::string> split(const std::string& value, char delimiter) {
   return fields;
 }
 
-bool checksumValid(const std::string& value) {
-  if (value.empty() || value[0] != '$') return false;
-  const auto star = value.find('*');
-  if (star == std::string::npos || star + 2 >= value.size()) return false;
-  unsigned checksum = 0;
-  for (std::size_t i = 1; i < star; ++i) checksum ^= static_cast<unsigned char>(value[i]);
-  char* end = nullptr;
-  const unsigned expected = static_cast<unsigned>(std::strtoul(value.substr(star + 1, 2).c_str(), &end, 16));
-  return end != nullptr && *end == '\0' && checksum == expected;
-}
-
-bool coordinate(const std::string& raw, const std::string& hemisphere, double& out) {
-  if (raw.empty() || hemisphere.empty()) return false;
-  char* end = nullptr;
-  const double packed = std::strtod(raw.c_str(), &end);
-  if (end == raw.c_str() || *end != '\0') return false;
-  const double degrees = std::floor(packed / 100.0);
-  out = degrees + (packed - degrees * 100.0) / 60.0;
-  if (hemisphere == "S" || hemisphere == "W") out = -out;
-  return hemisphere == "N" || hemisphere == "S" || hemisphere == "E" || hemisphere == "W";
-}
-
 }  // namespace
-
-bool parseNmeaSentence(const std::string& sentence, GnssFix& fix) {
-  if (!checksumValid(sentence)) return false;
-  const auto star = sentence.find('*');
-  const auto fields = split(sentence.substr(1, star - 1), ',');
-  if (fields.empty()) return true;
-  const std::string type = fields[0].size() >= 3 ? fields[0].substr(fields[0].size() - 3) : fields[0];
-  if (type == "GGA" && fields.size() >= 10) {
-    double latitude = 0.0, longitude = 0.0;
-    const bool positioned = coordinate(fields[2], fields[3], latitude) &&
-                            coordinate(fields[4], fields[5], longitude);
-    fix.valid = positioned && std::atoi(fields[6].c_str()) > 0;
-    if (positioned) { fix.latitude = latitude; fix.longitude = longitude; }
-    fix.utc = fields[1];
-    fix.satellites = std::atoi(fields[7].c_str());
-    fix.altitude_m = std::strtod(fields[9].c_str(), nullptr);
-    fix.last_sentence = sentence;
-  } else if (type == "RMC" && fields.size() >= 8) {
-    double latitude = 0.0, longitude = 0.0;
-    const bool positioned = coordinate(fields[3], fields[4], latitude) &&
-                            coordinate(fields[5], fields[6], longitude);
-    fix.valid = fields[2] == "A" && positioned;
-    if (positioned) { fix.latitude = latitude; fix.longitude = longitude; }
-    fix.utc = fields[1];
-    fix.speed_knots = std::strtod(fields[7].c_str(), nullptr);
-    fix.last_sentence = sentence;
-  }
-  return true;
-}
 
 GnssReceiver::~GnssReceiver() { stop(); }
 
@@ -86,8 +97,18 @@ void GnssReceiver::processLine(const std::string& raw) {
   while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
   if (line.empty()) return;
   last_response_ = line;
+  // "#XGPS: " (not "#XGPSPOS:", which this firmware never actually sends -
+  // confirmed against Nordic's own documented format and this exact
+  // modem's real output) is reused for both the synchronous command
+  // acknowledgment (e.g. "#XGPS: 1,1", 2 fields) and the asynchronous fix
+  // notification ("#XGPS: <lat>,<lon>,<alt>,<accuracy>,<speed>,<heading>,
+  // <datetime>", 7 fields) - the field-count check below is what tells
+  // them apart, not the prefix. #XGNSS (the modern API) is unverified
+  // against real hardware, since this modem's firmware doesn't support it
+  // at all (AT#XGNSS=? returns ERROR) - left as its best-documented guess
+  // rather than changed without a way to confirm it.
   const char* position_prefix = line.find("#XGNSSPOS:") != std::string::npos
-      ? "#XGNSSPOS:" : line.find("#XGPSPOS:") != std::string::npos ? "#XGPSPOS:" : nullptr;
+      ? "#XGNSSPOS:" : line.find("#XGPS:") != std::string::npos ? "#XGPS:" : nullptr;
   const auto fix_position = position_prefix == nullptr ? std::string::npos : line.find(position_prefix);
   if (fix_position != std::string::npos) {
     const auto fields = split(line.substr(fix_position + std::char_traits<char>::length(position_prefix)), ',');
@@ -161,6 +182,15 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
   last_response_.clear();
   modem_info_.clear();
   api_info_.clear();
+  if (!setEnableLine(enable_chip_, enable_request_, true)) {
+    error = "unable to drive the nRF9151 enable line (gpiochip0 line 2)";
+    return false;
+  }
+  // The modem needs time to boot its AT command interface after being
+  // enabled - confirmed responsive within ~2s in manual testing; this is
+  // cheap insurance before the first exchange() (which itself already
+  // retries for 1500ms) rather than a tightly-measured minimum.
+  usleep(300000);
   fd_ = open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
   if (fd_ < 0) { error = "unable to open modem UART"; return false; }
   termios tty{};
@@ -252,6 +282,7 @@ void GnssReceiver::stop() {
   if (fd_ >= 0) close(fd_);
   fd_ = -1;
   buffer_.clear();
+  releaseEnableLine(enable_chip_, enable_request_);
   status_ = "GNSS idle";
 }
 

@@ -29,7 +29,6 @@ add_executable(reconclave_k230
   src/mdns_responder.cpp
   src/wifi_scanner.cpp
   src/network_inventory.cpp
-  src/gnss_receiver.cpp
   src/network_tools.cpp
   src/trust_crypto.cpp
   src/trust_policy.cpp
@@ -44,7 +43,7 @@ target_include_directories(reconclave_k230 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(BUILD_TESTING)
   add_executable(sightline_recon_tests
     tests/k230_recon_tests.cpp
-    src/network_inventory.cpp src/wifi_scanner.cpp src/gnss_receiver.cpp
+    src/network_inventory.cpp src/wifi_scanner.cpp src/gnss_nmea.cpp
     src/network_tools.cpp src/trust_crypto.cpp src/json.cpp src/trust_policy.cpp
     src/discovery_job.cpp src/evidence_store.cpp src/host_knowledge.cpp)
   target_link_libraries(sightline_recon_tests PRIVATE pthread)
@@ -128,6 +127,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
     src/ui_shell.cpp
     src/wifi_scanner.cpp
     src/network_inventory.cpp
+    src/gnss_nmea.cpp
     src/gnss_receiver.cpp
     src/json.cpp
     src/trust_crypto.cpp

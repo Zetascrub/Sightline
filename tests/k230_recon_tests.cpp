@@ -9,7 +9,7 @@
 
 #include "network_inventory.h"
 #include "wifi_scanner.h"
-#include "gnss_receiver.h"
+#include "gnss_nmea.h"
 #include "network_tools.h"
 #include "trust_crypto.h"
 #include "trust_policy.h"

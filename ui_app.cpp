@@ -95,10 +95,14 @@ constexpr char kUiCommandPath[] = "/run/reconclave/ui-command";
 // black/garbage) test capture, as opposed to /dev/video0 (a memory-to-memory
 // codec node, not a camera) or /dev/video1 (same ISP pipeline, unverified).
 constexpr char kCameraDevice[] = "/dev/video2";
-// The keyboard base exposes an nRF9151 UART, but the shipped modem firmware
-// does not currently accept the GNSS configuration required by Reconclave.
-// Keep the UI honest until that module is updated independently.
-constexpr bool kGnssAvailable = false;
+// The keyboard base exposes an nRF9151 UART. This was previously believed
+// disabled because the shipped modem firmware "does not accept the GNSS
+// configuration required by Reconclave" - that diagnosis was wrong: the
+// modem was simply never powered on (see GnssReceiver::start(), which now
+// drives its enable line via gpiod before opening the UART). Confirmed on
+// real hardware: identical AT commands that previously timed out with zero
+// bytes received now succeed immediately once the enable line is high.
+constexpr bool kGnssAvailable = true;
 
 volatile sig_atomic_t g_running = 1;
 void handleSignal(int) { g_running = 0; }
