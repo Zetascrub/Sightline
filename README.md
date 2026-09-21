@@ -885,6 +885,18 @@ row, which still claimed GNSS required new modem firmware. The corrected UI
 build was deployed and restarted successfully; a live fix still needs an
 outdoor test.
 
+Further live UI testing found intermittent startup timing: the modem can emit
+`Ready` before it will answer `AT`. Startup now retries `AT` until it receives
+`OK` (up to five 1.2-second attempts), and a rejected legacy GPS start checks
+whether GPS is already active before one delayed retry and the existing mode
+recovery. The LOCATION screen now distinguishes **GNSS OFF**, **START FAILED**,
+**SEARCHING FOR FIX**, and **FIX ACQUIRED**, with Start/Stop/Retry control and
+modem/API diagnostics. The same UI start path can be exercised through the
+root-only `/run/reconclave/ui-command` file (`gnss start` / `gnss stop`). On the
+device, the deployed UI reported `RUNNING yes` and `Legacy GPS active; waiting
+for position report` after `gnss start`. An outdoor position fix remains to be
+verified.
+
 `src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
 coordinate helpers were split out of `gnss_receiver.cpp` into their own
 files with no libgpiod dependency. This wasn't a style preference - once

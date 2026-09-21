@@ -8,6 +8,7 @@
 #include <poll.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <sstream>
 #include <vector>
 
@@ -146,7 +147,10 @@ void GnssReceiver::processLine(const std::string& raw) {
 
 bool GnssReceiver::exchange(const char* command, int timeout_ms, std::string& response) {
   response.clear();
-  if (!sendCommand(command)) return false;
+  if (!sendCommand(command)) {
+    std::fprintf(stderr, "reconclave gnss: %s -> write failed\n", command);
+    return false;
+  }
   const int slices = timeout_ms / 50 + 1;
   std::string reply;
   for (int i = 0; i < slices; ++i) {
@@ -165,8 +169,14 @@ bool GnssReceiver::exchange(const char* command, int timeout_ms, std::string& re
       processLine(line);
       if (!response.empty()) response += " | ";
       response += line;
-      if (line == "OK") return true;
-      if (line == "ERROR" || line.find("+CME ERROR") != std::string::npos) return false;
+      if (line == "OK" || line == "ERROR" || line.find("+CME ERROR") != std::string::npos) {
+        std::fprintf(stderr, "reconclave gnss: %s -> %s\n", command, line.c_str());
+        // A USB/UART read can contain an unsolicited line after the command's
+        // terminal response. Keep its partial bytes for poll() instead of
+        // dropping the first half of a #XGPS notification.
+        buffer_.append(reply);
+        return line == "OK";
+      }
     }
   }
   if (!reply.empty()) {
@@ -174,6 +184,7 @@ bool GnssReceiver::exchange(const char* command, int timeout_ms, std::string& re
     if (!response.empty()) response += " | ";
     response += reply;
   }
+  std::fprintf(stderr, "reconclave gnss: %s -> timeout (%zu bytes)\n", command, response.size());
   return false;
 }
 
@@ -184,6 +195,7 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
   api_info_.clear();
   if (!setEnableLine(enable_chip_, enable_request_, true)) {
     error = "unable to drive the nRF9151 enable line (gpiochip0 line 2)";
+    status_ = "GNSS error: " + error;
     return false;
   }
   // The modem needs time to boot its AT command interface after being
@@ -192,20 +204,32 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
   // retries for 1500ms) rather than a tightly-measured minimum.
   usleep(300000);
   fd_ = open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-  if (fd_ < 0) { error = "unable to open modem UART"; return false; }
+  if (fd_ < 0) {
+    error = "unable to open modem UART";
+    stop(); status_ = "GNSS error: " + error; return false;
+  }
   termios tty{};
-  if (tcgetattr(fd_, &tty) != 0) { error = "unable to configure modem UART"; stop(); return false; }
+  if (tcgetattr(fd_, &tty) != 0) {
+    error = "unable to configure modem UART";
+    stop(); status_ = "GNSS error: " + error; return false;
+  }
   cfmakeraw(&tty);
   cfsetispeed(&tty, B115200);
   cfsetospeed(&tty, B115200);
   tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8 | CLOCAL | CREAD;
   tty.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
-  if (tcsetattr(fd_, TCSANOW, &tty) != 0) { error = "unable to apply modem UART settings"; stop(); return false; }
+  if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
+    error = "unable to apply modem UART settings";
+    stop(); status_ = "GNSS error: " + error; return false;
+  }
   tcflush(fd_, TCIOFLUSH);
   fix_ = GnssFix{};
   nmea_count_ = 0;
   std::string response;
-  if (!exchange("AT", 1500, response)) {
+  bool modem_ready = false;
+  for (int attempt = 0; attempt < 5 && !modem_ready; ++attempt)
+    modem_ready = exchange("AT", 1200, response);
+  if (!modem_ready) {
     error = "nRF9151 did not answer AT" + (response.empty() ? std::string() : ": " + response);
     const std::string diagnosis = error;
     stop(); status_ = "GNSS error: " + diagnosis; return false;
@@ -245,14 +269,26 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
     stop(); status_ = "GNSS error: " + diagnosis; return false;
   }
   bool legacy_gps = false;
+  std::string legacy_failure;
   if ((!modern_supported || !exchange("AT#XGNSS=1,0,1", 3000, response)) &&
       (!modern_supported || !exchange("AT#XGNSS=1,0,0,0", 3000, response))) {
     std::string state;
-    const bool modern_active = exchange("AT#XGNSS?", 2000, state) &&
+    const bool modern_active = modern_supported && exchange("AT#XGNSS?", 2000, state) &&
         state.find("#XGNSS: 1") != std::string::npos;
     if (!modern_active) {
       // Nordic Serial LTE Modem releases through NCS 3.1 called this API XGPS.
       legacy_gps = legacy_supported && exchange("AT#XGPS=1,0,0,0", 3000, response);
+      legacy_failure = response;
+      if (legacy_supported && !legacy_gps) {
+        std::string gps_state;
+        legacy_gps = exchange("AT#XGPS?", 2000, gps_state) &&
+            gps_state.find("#XGPS: 1,") != std::string::npos;
+        if (!legacy_gps) {
+          usleep(300000);
+          legacy_gps = exchange("AT#XGPS=1,0,0,0", 3000, response);
+          if (!legacy_gps) legacy_failure = response;
+        }
+      }
       if (legacy_supported && !legacy_gps) {
         // Some nRF9151/SLM combinations advertise the legacy API but reject
         // its standalone CFUN=31 path. Retry in the documented concurrent
@@ -262,11 +298,12 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
             exchange("AT%XSYSTEMMODE=1,0,1,0", 3000, recovery) &&
             exchange("AT+CFUN=1", 9000, recovery)) {
           legacy_gps = exchange("AT#XGPS=1,0,0,0", 3000, response);
+          if (!legacy_gps) legacy_failure = response;
         }
       }
     }
     if (!modern_active && !legacy_gps) {
-      error = "GNSS/XGPS start rejected: " + response;
+      error = "AT#XGPS=1,0,0,0 rejected: " + legacy_failure;
       const std::string diagnosis = error;
       stop(); status_ = "GNSS error: " + diagnosis; return false;
     }
@@ -283,6 +320,7 @@ void GnssReceiver::stop() {
   fd_ = -1;
   buffer_.clear();
   releaseEnableLine(enable_chip_, enable_request_);
+  fix_ = GnssFix{};
   status_ = "GNSS idle";
 }
 

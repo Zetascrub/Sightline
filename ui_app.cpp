@@ -184,6 +184,10 @@ constexpr int kCaptureHeight = 1080;
 lv_obj_t* g_device_details = nullptr;
 lv_obj_t* g_device_services = nullptr;
 lv_obj_t* g_gnss_details = nullptr;
+lv_obj_t* g_gnss_state = nullptr;
+lv_obj_t* g_gnss_hint = nullptr;
+lv_obj_t* g_gnss_diagnostics = nullptr;
+lv_obj_t* g_gnss_action_label = nullptr;
 reconclave::GnssReceiver g_gnss;
 std::string g_project_id{"UNASSIGNED"};
 std::string g_engagement_id{"UNASSIGNED"};
@@ -304,6 +308,15 @@ void writeGnssRuntimeStatus() {
   }
   out.close();
   if (out.good()) rename(temporary.c_str(), "/run/reconclave/gnss-status");
+}
+
+void setGnssRunning(bool requested) {
+  if (requested && !g_gnss.running()) {
+    std::string error;
+    g_gnss.start("/dev/ttyS3", error);
+  } else if (!requested && g_gnss.running()) {
+    g_gnss.stop();
+  }
 }
 
 // Host drill-down (RECON's host list -> Host Detail) and the Findings list.
@@ -1571,7 +1584,11 @@ void refreshLiveDetails(lv_timer_t*) {
   if (!ui_command.empty()) {
     unlink(kUiCommandPath);
     constexpr char kPrefix[] = "screen ";
-    if (ui_command.rfind(kPrefix, 0) == 0) {
+    if (ui_command == "gnss start") {
+      setGnssRunning(true);
+    } else if (ui_command == "gnss stop") {
+      setGnssRunning(false);
+    } else if (ui_command.rfind(kPrefix, 0) == 0) {
       const std::string requested = ui_command.substr(sizeof(kPrefix) - 1);
       const auto target = std::find_if(g_ui_screens.begin(), g_ui_screens.end(),
           [&](const auto& entry) { return entry.first == requested; });
@@ -1648,29 +1665,48 @@ void refreshLiveDetails(lv_timer_t*) {
     lv_label_set_text(g_recon_details, detail.c_str());
   }
   if (g_gnss_details != nullptr) {
+    using namespace reconclave::ui;
     const auto& fix = g_gnss.fix();
+    const bool running = g_gnss.running();
+    const bool failed = !running && g_gnss.status().rfind("GNSS error:", 0) == 0;
+    const char* state = running ? (fix.valid ? "FIX ACQUIRED" : "SEARCHING FOR FIX")
+                                : (failed ? "START FAILED" : "GNSS OFF");
+    const char* hint = running ? (fix.valid ? "Position available for evidence"
+                                          : "Receiver on  //  waiting for satellite lock")
+                               : (failed ? "Receiver off  //  check the error below"
+                                         : "Receiver off  //  tap Start GNSS");
+    lv_label_set_text(g_gnss_state, state);
+    lv_obj_set_style_text_color(g_gnss_state,
+        lv_color_hex(running ? (fix.valid ? kColorAccent : kColorAmber)
+                             : (failed ? kColorAmber : kColorSecondary)), 0);
+    lv_label_set_text(g_gnss_hint, hint);
+    lv_label_set_text(g_gnss_action_label,
+        running ? LV_SYMBOL_STOP " Stop GNSS" : failed ? LV_SYMBOL_REFRESH " Retry GNSS"
+                                                  : LV_SYMBOL_PLAY " Start GNSS");
     std::ostringstream details;
-    if (!kGnssAvailable) {
-      details << LV_SYMBOL_WARNING "  GNSS MODULE UNAVAILABLE\n"
-              << "nRF9151  //  KEYBOARD EXPANSION UART DETECTED\n\n"
-              << "POSITION        --\nSATELLITES      --\nFIX AGE         --\n\n"
-              << "The installed modem firmware does not provide the required GNSS command set.\n\n"
-              << "EVIDENCE GEO-TAGGING\nDisabled  //  captures remain explicitly marked location_valid=false";
-    } else if (fix.valid) {
-      details << LV_SYMBOL_GPS "  " << g_gnss.status() << "\n\n";
+    if (running && fix.valid) {
       details << std::fixed << std::setprecision(7) << "LATITUDE     " << fix.latitude
               << "\nLONGITUDE    " << fix.longitude << std::setprecision(1)
               << "\nALTITUDE     " << fix.altitude_m << " m"
               << "\nSATELLITES   " << fix.satellites
-              << "\nSPEED        " << fix.speed_knots << " kn"
-              << "\nUTC          " << fix.utc << "\n\nEvidence geotagging active";
+              << "\nUTC          " << fix.utc;
+    } else if (running) {
+      details << "No position yet\n"
+              << "Satellites: " << fix.satellites << "  //  NMEA: " << g_gnss.nmeaCount()
+              << "\nMove outdoors with a clear sky view. A cold fix may take several minutes.";
+    } else if (failed) {
+      details << g_gnss.status() << "\nTap Retry GNSS to try again.";
     } else {
-      details << (g_gnss.running() ? LV_SYMBOL_GPS "  " : LV_SYMBOL_WARNING "  ")
-              << g_gnss.status() << "\n\n";
-      details << "No valid position yet\n\nMove outdoors with a clear sky view. A cold fix may take several minutes."
-              << "\n\nWi-Fi evidence remains explicitly marked location_valid=false until a fix is acquired.";
+      details << "The modem and GPS are stopped.\n"
+              << "Tap Start GNSS, then allow time for a satellite fix outdoors.";
     }
     lv_label_set_text(g_gnss_details, details.str().c_str());
+    std::ostringstream diagnostics;
+    diagnostics << "EVIDENCE  " << (running && fix.valid ? "Geotagging active" : "No location tag")
+                << "\nMODEM  " << (g_gnss.modemInfo().empty() ? "Not queried" : g_gnss.modemInfo())
+                << "\nAPI  " << (g_gnss.apiInfo().empty() ? "Not queried" : g_gnss.apiInfo())
+                << "\nLAST  " << (g_gnss.lastResponse().empty() ? "--" : g_gnss.lastResponse());
+    lv_label_set_text(g_gnss_diagnostics, diagnostics.str().c_str());
   }
   if (g_node_details != nullptr) {
     refreshNodeDetails();
@@ -2423,20 +2459,14 @@ lv_obj_t* buildLocationScreen(lv_obj_t* home) {
   lv_obj_set_style_shadow_width(start_button, 0, 0);
   lv_obj_set_style_radius(start_button, 8, 0);
   lv_obj_add_event_cb(start_button, [](lv_event_t*) {
-    std::string error;
-    if (!g_gnss.running()) {
-      g_gnss.start("/dev/ttyS3", error);
-    }
-    if (!error.empty() && g_gnss_details != nullptr) {
-      lv_label_set_text(g_gnss_details, error.c_str());
-      return;
-    }
+    setGnssRunning(!g_gnss.running());
     refreshLiveDetails(nullptr);
   }, LV_EVENT_CLICKED, nullptr);
   if (!kGnssAvailable) lv_obj_add_state(start_button, LV_STATE_DISABLED);
   lv_obj_t* start_label = lv_label_create(start_button);
   lv_label_set_text(start_label, kGnssAvailable ? LV_SYMBOL_PLAY " Start GNSS"
                                                 : LV_SYMBOL_CLOSE " GNSS unavailable");
+  g_gnss_action_label = start_label;
   lv_obj_set_style_text_color(start_label, lv_color_hex(kColorAccent), 0);
   lv_obj_center(start_label);
 
@@ -2449,12 +2479,29 @@ lv_obj_t* buildLocationScreen(lv_obj_t* home) {
   lv_obj_set_style_radius(card, 12, 0);
   lv_obj_set_style_pad_all(card, 18, 0);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  g_gnss_state = lv_label_create(card);
+  lv_obj_set_width(g_gnss_state, lv_pct(100));
+  lv_obj_set_style_text_font(g_gnss_state, &lv_font_montserrat_24, 0);
+  lv_obj_align(g_gnss_state, LV_ALIGN_TOP_LEFT, 0, 0);
+  g_gnss_hint = lv_label_create(card);
+  lv_obj_set_width(g_gnss_hint, lv_pct(100));
+  lv_obj_set_style_text_font(g_gnss_hint, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(g_gnss_hint, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(g_gnss_hint, LV_ALIGN_TOP_LEFT, 0, 42);
   g_gnss_details = lv_label_create(card);
   lv_obj_set_width(g_gnss_details, lv_pct(100));
+  lv_obj_set_height(g_gnss_details, 155);
   lv_label_set_long_mode(g_gnss_details, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_style_text_color(g_gnss_details, lv_color_hex(kColorForeground), 0);
   lv_obj_set_style_text_font(g_gnss_details, &lv_font_montserrat_16, 0);
-  lv_obj_align(g_gnss_details, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_align(g_gnss_details, LV_ALIGN_TOP_LEFT, 0, 88);
+  g_gnss_diagnostics = lv_label_create(card);
+  lv_obj_set_width(g_gnss_diagnostics, lv_pct(100));
+  lv_obj_set_height(g_gnss_diagnostics, 116);
+  lv_label_set_long_mode(g_gnss_diagnostics, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_set_style_text_color(g_gnss_diagnostics, lv_color_hex(kColorSecondary), 0);
+  lv_obj_set_style_text_font(g_gnss_diagnostics, &lv_font_montserrat_14, 0);
+  lv_obj_align(g_gnss_diagnostics, LV_ALIGN_TOP_LEFT, 0, 260);
   return screen;
 }
 
