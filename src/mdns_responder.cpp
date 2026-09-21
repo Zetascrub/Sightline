@@ -87,6 +87,16 @@ MdnsResponder::~MdnsResponder() {
 bool MdnsResponder::start(const std::string& hostname, const std::string& service_type,
                            std::uint16_t port, const std::string& local_ipv4,
                            const std::string& txt_key, const std::string& txt_value) {
+  // Makes start() safe to call again after an earlier failed/successful
+  // call on the same instance - the destructor already releases these on
+  // object teardown, but a caller that retries start() itself (e.g. once
+  // DHCP settles) would otherwise leak the previous sock_/address_ipv4_
+  // each time, since they're unconditionally overwritten below.
+  if (sock_ >= 0) { close(sock_); sock_ = -1; }
+  delete static_cast<Records*>(records_); records_ = nullptr;
+  delete address_ipv4_; address_ipv4_ = nullptr;
+  ::operator delete(buffer_); buffer_ = nullptr; buffer_capacity_ = 0;
+
   sockaddr_in bind_addr{};
   bind_addr.sin_family = AF_INET;
   bind_addr.sin_addr.s_addr = INADDR_ANY;

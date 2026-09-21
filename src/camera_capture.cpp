@@ -64,15 +64,28 @@ CaptureResult captureStill(const std::string& device, const std::string& output_
   int elapsed_ms = 0;
   int status = 0;
   bool exited = false;
+  bool wait_failed = false;
   while (elapsed_ms < timeout_ms) {
     const pid_t outcome = waitpid(pid, &status, WNOHANG);
     if (outcome == pid) {
       exited = true;
       break;
     }
-    if (outcome < 0) break;
+    if (outcome < 0) {
+      // The child is already gone from under us (e.g. ECHILD because
+      // something else reaped it) - there is no live pid left to signal or
+      // wait on, so treat this as its own failure instead of falling
+      // through to kill()/waitpid() on what may now be a recycled pid.
+      wait_failed = true;
+      break;
+    }
     usleep(static_cast<useconds_t>(kPollIntervalMs) * 1000);
     elapsed_ms += kPollIntervalMs;
+  }
+  if (wait_failed) {
+    result.error = "camera capture wait failed";
+    unlink(output_path.c_str());
+    return result;
   }
   if (!exited) {
     kill(pid, SIGKILL);

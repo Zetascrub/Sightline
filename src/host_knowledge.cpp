@@ -102,6 +102,7 @@ std::vector<HostRecord> HostKnowledge::snapshot() const {
 json::Value HostKnowledge::toJson() const {
   json::Value result = json::Value::makeObject();
   json::Value entries = json::Value::makeArray();
+  std::size_t attention_count = 0;
   for (const auto& map_entry : hosts_) {
     const HostRecord& host = map_entry.second;
     json::Value entry = json::Value::makeObject();
@@ -120,6 +121,7 @@ json::Value HostKnowledge::toJson() const {
       item.set("attention", json::Value::makeString(service.attention));
       item.set("last_seen_ms", json::Value::makeNumber(static_cast<double>(service.last_seen_ms)));
       services.push_back(item);
+      if (!service.attention.empty()) ++attention_count;
     }
     entry.set("services", services);
     entry.set("first_seen_ms", json::Value::makeNumber(static_cast<double>(host.first_seen_ms)));
@@ -129,7 +131,7 @@ json::Value HostKnowledge::toJson() const {
     entries.push_back(entry);
   }
   result.set("count", json::Value::makeNumber(static_cast<double>(hosts_.size())));
-  result.set("attention_count", json::Value::makeNumber(static_cast<double>(attentionCount())));
+  result.set("attention_count", json::Value::makeNumber(static_cast<double>(attention_count)));
   result.set("hosts", entries);
   return result;
 }

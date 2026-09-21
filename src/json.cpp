@@ -74,7 +74,12 @@ double Value::asNumber(double fallback) const {
 }
 
 std::uint64_t Value::asUInt64(std::uint64_t fallback) const {
-  if (type_ != Type::Number || number_ < 0) return fallback;
+  // Casting a double outside [0, 2^64) to uint64_t is undefined behavior;
+  // reject it before the cast rather than after, since a caller on an
+  // authentication path (trust_policy.cpp's uintField()) feeds this
+  // directly from untrusted request JSON.
+  constexpr double kTwoPow64 = 18446744073709551616.0;
+  if (type_ != Type::Number || number_ < 0 || number_ >= kTwoPow64) return fallback;
   return static_cast<std::uint64_t>(number_);
 }
 

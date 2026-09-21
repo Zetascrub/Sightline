@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -19,6 +20,14 @@ namespace {
 // status; stdout captured so far is still returned in `out` either way,
 // since a partial/empty scan result is more useful to a caller than
 // nothing.
+//
+// Bounded wait: poll for the child's exit rather than blocking on waitpid()
+// unconditionally, matching camera_capture.cpp's runCapture-equivalent.
+// scanWifi() runs synchronously on the single-threaded main reactor
+// (radio.wifi.scan), so a wedged iwlist/driver call must not be able to
+// hang the whole node's HTTP/mDNS handling indefinitely.
+constexpr int kCaptureTimeoutMs = 15000;
+
 bool runCapture(const std::vector<std::string>& argv, std::string& out, std::string& error) {
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
@@ -60,9 +69,27 @@ bool runCapture(const std::vector<std::string>& argv, std::string& out, std::str
   }
   close(pipe_fds[0]);
 
+  constexpr int kPollIntervalMs = 100;
+  int elapsed_ms = 0;
   int status = 0;
-  if (waitpid(pid, &status, 0) < 0) {
-    error = "waitpid() failed";
+  bool exited = false;
+  while (elapsed_ms < kCaptureTimeoutMs) {
+    const pid_t outcome = waitpid(pid, &status, WNOHANG);
+    if (outcome == pid) {
+      exited = true;
+      break;
+    }
+    if (outcome < 0) {
+      error = "waitpid() failed";
+      return false;
+    }
+    usleep(static_cast<useconds_t>(kPollIntervalMs) * 1000);
+    elapsed_ms += kPollIntervalMs;
+  }
+  if (!exited) {
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    error = "command timed out";
     return false;
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -195,7 +222,9 @@ WifiSurveySummary analyseWifi(const std::vector<WifiObservation>& observations) 
     if (ap.ssid.empty()) ++summary.hidden;
     if (ap.channel >= 1 && ap.channel <= 14) ++summary.two_ghz;
     else if (ap.channel > 14) ++summary.five_ghz;
-    summary.strongest_rssi_dbm = std::max(summary.strongest_rssi_dbm, ap.rssi_dbm);
+    if (ap.rssi_dbm != kNoRssiDbm) {
+      summary.strongest_rssi_dbm = std::max(summary.strongest_rssi_dbm, ap.rssi_dbm);
+    }
     for (std::size_t i = 0; i < 3; ++i) {
       const int distance = std::abs(ap.channel - channels[i]);
       if (distance <= 4) loads[i] += std::max(1, 100 + ap.rssi_dbm) * (5 - distance);

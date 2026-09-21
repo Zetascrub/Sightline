@@ -45,4 +45,10 @@ bool identifyService(const std::string& address, std::uint16_t port, int timeout
                      ServiceObservation& observation);
 std::string classifyService(std::uint16_t port, const std::string& banner);
 
+// The ports classifyService() knows how to label by number alone. Exposed so
+// callers that decide which ports are "worth checking" (discovery_job.cpp's
+// host scan) stay in sync with classification instead of maintaining an
+// independent list that can drift.
+const std::vector<std::uint16_t>& knownServicePorts();
+
 }  // namespace reconclave

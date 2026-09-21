@@ -65,6 +65,53 @@ int connectSocket(const std::string& address, std::uint16_t port, int timeout_ms
   return -1;
 }
 
+// Single source of truth for "which port maps to which service name" -
+// classifyService()'s port fallback, knownServicePorts() (what
+// discovery_job.cpp scans) and the cleartext-attention lookup below all
+// derive from this one table instead of three independently maintained
+// lists.
+struct KnownPort {
+  std::uint16_t port;
+  const char* service;
+};
+constexpr KnownPort kKnownPorts[] = {
+    {21, "ftp"},   {22, "ssh"},    {23, "telnet"}, {25, "smtp"},
+    {53, "dns"},   {80, "http"},   {110, "pop3"},  {143, "imap"},
+    {443, "https"}, {445, "smb"},  {554, "rtsp"},  {3389, "rdp"},
+    {8000, "http"}, {8080, "http"}, {8443, "https"},
+};
+
+const char* portService(std::uint16_t port) {
+  for (const auto& entry : kKnownPorts) {
+    if (entry.port == port) return entry.service;
+  }
+  return "unknown";
+}
+
+// Services this tool actively flags as worth an operator's attention because
+// they carry credentials or content in the clear. Keyed by the same service
+// names classifyService() already produces, so a service recognised there is
+// never silently missing from here.
+struct CleartextAttention {
+  const char* service;
+  const char* message;
+};
+constexpr CleartextAttention kCleartextAttention[] = {
+    {"telnet", "cleartext remote administration"},
+    {"ftp", "cleartext file-transfer service"},
+    {"http", "cleartext web service"},
+    {"smtp", "cleartext mail-transfer service"},
+    {"pop3", "cleartext mail-retrieval service"},
+    {"imap", "cleartext mail-retrieval service"},
+};
+
+std::string cleartextAttention(const std::string& service) {
+  for (const auto& entry : kCleartextAttention) {
+    if (service == entry.service) return entry.message;
+  }
+  return "";
+}
+
 std::string printableBanner(const char* data, std::size_t length) {
   std::string result;
   result.reserve(std::min<std::size_t>(length, 256));
@@ -144,21 +191,16 @@ std::string classifyService(std::uint16_t port, const std::string& banner) {
   if (lower.find("http/") != std::string::npos) return "http";
   if (lower.find("smtp") != std::string::npos) return "smtp";
   if (lower.find("ftp") != std::string::npos) return "ftp";
-  switch (port) {
-    case 21: return "ftp";
-    case 22: return "ssh";
-    case 23: return "telnet";
-    case 25: return "smtp";
-    case 53: return "dns";
-    case 80: case 8000: case 8080: return "http";
-    case 110: return "pop3";
-    case 143: return "imap";
-    case 443: case 8443: return "https";
-    case 445: return "smb";
-    case 554: return "rtsp";
-    case 3389: return "rdp";
-    default: return "unknown";
-  }
+  return portService(port);
+}
+
+const std::vector<std::uint16_t>& knownServicePorts() {
+  static const std::vector<std::uint16_t> ports = [] {
+    std::vector<std::uint16_t> result;
+    for (const auto& entry : kKnownPorts) result.push_back(entry.port);
+    return result;
+  }();
+  return ports;
 }
 
 bool identifyService(const std::string& address, std::uint16_t port, int timeout_ms,
@@ -172,7 +214,7 @@ bool identifyService(const std::string& address, std::uint16_t port, int timeout
   if (fd < 0) return false;
   observation.connected = true;
 
-  if (port == 80 || port == 8000 || port == 8080) {
+  if (portService(port) == std::string("http")) {
     const std::string request = "HEAD / HTTP/1.0\r\nHost: " + address +
                                 "\r\nConnection: close\r\n\r\n";
     (void)send(fd, request.data(), request.size(), MSG_NOSIGNAL);
@@ -185,9 +227,7 @@ bool identifyService(const std::string& address, std::uint16_t port, int timeout
   }
   close(fd);
   observation.service = classifyService(port, observation.banner);
-  if (observation.service == "telnet") observation.attention = "cleartext remote administration";
-  else if (observation.service == "ftp") observation.attention = "cleartext file-transfer service";
-  else if (observation.service == "http") observation.attention = "cleartext web service";
+  observation.attention = cleartextAttention(observation.service);
   return true;
 }
 

@@ -18,6 +18,8 @@ struct EvidenceVerification {
   std::uint64_t records = 0;
   std::uint64_t first_invalid_record = 0;
   std::string error;
+  // record_hash of the last record, once the whole chain has verified valid.
+  std::string last_hash;
 };
 
 class EvidenceStore {

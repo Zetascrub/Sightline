@@ -362,8 +362,11 @@ int main() {
     std::fprintf(stderr, "host knowledge load failed: %s\n", host_error.c_str());
   }
   const char* configured_key_path = std::getenv("RECONCLAVE_EXECUTION_KEY_FILE");
-  trust.loadExecutionKey(configured_key_path ? configured_key_path :
-                          "/root/reconclave/trust/execution.key", trust_error);
+  if (!trust.loadExecutionKey(configured_key_path ? configured_key_path :
+                               "/root/reconclave/trust/execution.key", trust_error)) {
+    std::fprintf(stderr, "execution trust key not loaded, assessment capabilities disabled: %s\n",
+                 trust_error.c_str());
+  }
 
   reconclave::NodeAnnouncement announcement;
   announcement.device_id = kDeviceId;
@@ -493,6 +496,11 @@ int main() {
   const double started_at = monotonicSeconds();
   std::uint64_t sequence = 0;
   std::string last_evidenced_job_id;
+  // Mirrors the most recent appendEvidence() failure so the dispatcher below
+  // can surface it on response_payload itself, not just nested inside
+  // "result" - a caller checking only the top-level "status" field must not
+  // be able to see "ok" when the evidence write for this response failed.
+  std::string last_evidence_error;
 
   auto appendEvidence = [&](const std::string& kind, reconclave::json::Value result) {
     std::string record_hash;
@@ -500,8 +508,10 @@ int main() {
     if (evidence.append(kind, result, reconclave::loadEvidenceContext(kSessionPath),
                         record_hash, evidence_error)) {
       result.set("evidence_record_hash", reconclave::json::Value::makeString(record_hash));
+      last_evidence_error.clear();
     } else {
       result.set("evidence_error", reconclave::json::Value::makeString(evidence_error));
+      last_evidence_error = evidence_error;
     }
     return result;
   };
@@ -655,6 +665,15 @@ int main() {
               response_payload.set("result", discoverySnapshot(discovery.snapshot()));
             }
           }
+        }
+        // A capability can execute successfully while its evidence-chain
+        // write still fails (disk full, chain-integrity rejection, ...);
+        // appendEvidence() already records that nested in "result", but a
+        // top-level "status"=="ok" alone must not read as "and it was
+        // evidenced" - mirror the failure here so it can't be missed.
+        if (!last_evidence_error.empty()) {
+          response_payload.set("evidence_error",
+                                reconclave::json::Value::makeString(last_evidence_error));
         }
         if (trusted_capability && !authenticated_nonce.empty()) {
           const auto* status = response_payload.find("status");

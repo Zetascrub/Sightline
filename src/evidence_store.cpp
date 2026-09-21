@@ -43,21 +43,28 @@ bool writeAll(int fd, const std::string& data) {
   return true;
 }
 
-}  // namespace
+std::string readAll(int fd) {
+  std::string contents;
+  char buffer[4096];
+  ssize_t count;
+  while ((count = read(fd, buffer, sizeof(buffer))) > 0) {
+    contents.append(buffer, static_cast<std::size_t>(count));
+  }
+  return contents;
+}
 
-EvidenceStore::EvidenceStore(std::string directory, std::string node_id)
-    : directory_(std::move(directory)), node_id_(std::move(node_id)) {}
-
-std::string EvidenceStore::timelinePath() const { return directory_ + "/timeline.jsonl"; }
-
-EvidenceVerification EvidenceStore::verify() const {
+// Pure hash-chain check over already-read file contents - no I/O or locking
+// of its own, so it's safe to call from a caller that already holds (or
+// itself just took) whatever lock covers `contents`.
+EvidenceVerification verifyContents(const std::string& contents) {
   EvidenceVerification result;
-  std::ifstream input(timelinePath());
-  if (!input) return result;
-
-  std::string line;
   std::string previous;
-  while (std::getline(input, line)) {
+  std::size_t line_pos = 0;
+  while (line_pos < contents.size()) {
+    const std::size_t newline = contents.find('\n', line_pos);
+    const std::string line = contents.substr(
+        line_pos, newline == std::string::npos ? std::string::npos : newline - line_pos);
+    line_pos = newline == std::string::npos ? contents.size() : newline + 1;
     ++result.records;
     json::Value record;
     std::string parse_error;
@@ -79,7 +86,35 @@ EvidenceVerification EvidenceStore::verify() const {
     }
     previous = stored->asString();
   }
+  result.last_hash = previous;
   return result;
+}
+
+}  // namespace
+
+EvidenceStore::EvidenceStore(std::string directory, std::string node_id)
+    : directory_(std::move(directory)), node_id_(std::move(node_id)) {}
+
+std::string EvidenceStore::timelinePath() const { return directory_ + "/timeline.jsonl"; }
+
+EvidenceVerification EvidenceStore::verify() const {
+  // append() holds an exclusive flock() while writing a new record; take a
+  // shared lock here so this (and createManifest(), which calls it) can
+  // never observe a torn/partial last line mid-write - std::ifstream alone
+  // gave no such guarantee. append() itself must NOT call this: it already
+  // holds LOCK_EX on its own open file description, and flock() locks are
+  // not reentrant across different file descriptions even in the same
+  // process, so doing so would deadlock against itself.
+  const int fd = open(timelinePath().c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return EvidenceVerification{};
+  if (flock(fd, LOCK_SH) != 0) {
+    close(fd);
+    return EvidenceVerification{};
+  }
+  const std::string contents = readAll(fd);
+  flock(fd, LOCK_UN);
+  close(fd);
+  return verifyContents(contents);
 }
 
 bool EvidenceStore::createManifest(const EvidenceContext& context, const std::string& firmware,
@@ -191,7 +226,13 @@ bool EvidenceStore::append(const std::string& kind, const json::Value& data,
     return false;
   }
 
-  const auto verification = verify();
+  // Read through the fd we already hold LOCK_EX on rather than calling
+  // verify() (which would open a second file description and deadlock
+  // trying to flock() it against our own exclusive lock). O_APPEND means
+  // this lseek doesn't affect where the write() below lands.
+  lseek(fd, 0, SEEK_SET);
+  const std::string contents = readAll(fd);
+  const auto verification = verifyContents(contents);
   if (!verification.valid) {
     error = "refusing to append to invalid evidence chain";
     flock(fd, LOCK_UN);
@@ -199,20 +240,7 @@ bool EvidenceStore::append(const std::string& kind, const json::Value& data,
     return false;
   }
 
-  std::string previous;
-  std::ifstream input(timelinePath());
-  std::string line;
-  std::string last;
-  while (std::getline(input, line)) {
-    if (!line.empty()) last = line;
-  }
-  if (!last.empty()) {
-    json::Value prior;
-    std::string ignored;
-    if (json::parse(last, prior, ignored)) {
-      if (const auto* prior_hash = prior.find("record_hash")) previous = prior_hash->asString();
-    }
-  }
+  const std::string& previous = verification.last_hash;
 
   json::Value record = json::Value::makeObject();
   record.set("schema", json::Value::makeString("reconclave-evidence/v1"));

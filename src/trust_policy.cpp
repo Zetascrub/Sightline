@@ -11,6 +11,11 @@
 
 namespace reconclave { namespace {
 constexpr std::size_t kRecentNonces = 64;
+// Only successfully HMAC-verified requests ever reach recent_nonces_ (see
+// verifyRequest below - the signature check happens before the map is
+// touched), but a legitimate coordinator that varies its source id per
+// request would otherwise still grow this map without bound.
+constexpr std::size_t kMaxTrackedSources = 256;
 
 std::string randomNonce() {
   std::array<unsigned char, 16> bytes{};
@@ -78,8 +83,17 @@ TrustDecision TrustPolicy::verifyRequest(const std::string& source,const std::st
     return deny("UNAUTHENTICATED","signed request metadata is invalid");
   std::ostringstream canonical; canonical<<source<<'|'<<device_id_<<'|'<<request_id<<'|'<<capability<<'|'<<boot_nonce_<<'|'<<digest<<'|'<<nonce<<'|'<<priority<<'|'<<lease;
   if(!constantTimeHexEqual(t->asString(),hmacSha256Hex(key_,canonical.str(),16))) return deny("UNAUTHENTICATED","invalid signature");
+  const bool new_source = recent_nonces_.find(source) == recent_nonces_.end();
   auto&seen=recent_nonces_[source]; if(std::find(seen.begin(),seen.end(),nonce)!=seen.end()) return deny("UNAUTHENTICATED","replayed request");
-  seen.push_back(nonce); if(seen.size()>kRecentNonces) seen.pop_front(); return {true,"","",nonce};
+  seen.push_back(nonce); if(seen.size()>kRecentNonces) seen.pop_front();
+  if(new_source){
+    nonce_source_order_.push_back(source);
+    if(nonce_source_order_.size()>kMaxTrackedSources){
+      recent_nonces_.erase(nonce_source_order_.front());
+      nonce_source_order_.pop_front();
+    }
+  }
+  return {true,"","",nonce};
 }
 
 TrustDecision TrustPolicy::verifyDelegatedScope(const std::string& capability,const json::Value& arguments,std::uint64_t now) const {

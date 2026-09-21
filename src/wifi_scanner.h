@@ -22,12 +22,18 @@
 
 namespace reconclave {
 
+// Out-of-range sentinel for "no Signal level= line was ever parsed for this
+// cell" - real iwlist RSSI readings never reach this low, so it can't be
+// confused with a genuine (if implausibly strong) 0 dBm reading the way a
+// plain 0 default could.
+constexpr int kNoRssiDbm = -128;
+
 struct WifiObservation {
   std::string ssid;
   std::string bssid;
   int channel = 0;
   int frequency_mhz = 0;
-  int rssi_dbm = 0;
+  int rssi_dbm = kNoRssiDbm;
   int quality_percent = 0;
   bool secured = false;
   std::string security{"open"};

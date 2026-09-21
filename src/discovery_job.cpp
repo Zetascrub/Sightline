@@ -4,7 +4,6 @@
 #include <time.h>
 
 #include <algorithm>
-#include <array>
 #include <cstdlib>
 
 #include "network_tools.h"
@@ -12,7 +11,6 @@
 namespace reconclave { namespace {
 constexpr unsigned kWorkers = 8;
 constexpr int kConnectTimeoutMs = 120;
-constexpr std::array<std::uint16_t, 8> kPorts = {22, 53, 80, 443, 445, 554, 3389, 8080};
 
 std::string addressText(std::uint32_t host_order) {
   in_addr address{htonl(host_order)}; char text[INET_ADDRSTRLEN]{};
@@ -43,10 +41,11 @@ bool DiscoveryJob::start(const std::string&network,std::string&error){
 void DiscoveryJob::cancel(){cancel_=true;}
 DiscoverySnapshot DiscoveryJob::snapshot()const{std::lock_guard<std::mutex>lock(mutex_);return state_;}
 void DiscoveryJob::run(std::uint32_t first,std::uint32_t last){
+  const std::vector<std::uint16_t>& ports = knownServicePorts();
   std::atomic<std::uint32_t>next{first};std::vector<std::thread>workers;
   for(unsigned worker=0;worker<kWorkers;++worker)workers.emplace_back([&,last]{
     while(!cancel_){const std::uint32_t value=next.fetch_add(1);if(value>last)break;DiscoveredHost host;host.address=addressText(value);
-      for(auto port:kPorts){if(cancel_)break;TcpObservation observation;if(tcpConnect(host.address,port,kConnectTimeoutMs,observation))host.open_ports.push_back(port);}
+      for(auto port:ports){if(cancel_)break;TcpObservation observation;if(tcpConnect(host.address,port,kConnectTimeoutMs,observation))host.open_ports.push_back(port);}
       std::lock_guard<std::mutex>lock(mutex_);++state_.checked;if(!host.open_ports.empty())state_.hosts.push_back(std::move(host));
     }});
   for (auto& worker : workers) worker.join();

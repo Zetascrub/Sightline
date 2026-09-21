@@ -42,6 +42,11 @@ class TrustPolicy {
   TrustKey key_{};
   bool configured_ = false;
   std::map<std::string, std::deque<std::string>> recent_nonces_;
+  // Insertion order of recent_nonces_' keys, so the oldest source can be
+  // evicted once the map grows past kMaxTrackedSources - only successfully
+  // HMAC-verified requests reach this map, but an authenticated coordinator
+  // that varies its source id should still not be able to grow it forever.
+  std::deque<std::string> nonce_source_order_;
 };
 
 }  // namespace reconclave
