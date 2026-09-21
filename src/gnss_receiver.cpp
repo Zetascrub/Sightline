@@ -259,6 +259,7 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
   if (!exchange("AT+CFUN=0", 6000, response))
     rejected_command = "AT+CFUN=0";
   const bool nmea_enabled = exchange("AT#XNMEA=1", 3000, response);
+  nmea_enabled_ = nmea_enabled;
   if (!exchange("AT%XSYSTEMMODE=0,0,1,0", 3000, response))
     rejected_command = "AT%XSYSTEMMODE=0,0,1,0";
   else if (!exchange("AT+CFUN=31", 9000, response))
@@ -320,6 +321,7 @@ void GnssReceiver::stop() {
   fd_ = -1;
   buffer_.clear();
   releaseEnableLine(enable_chip_, enable_request_);
+  nmea_enabled_ = false;
   fix_ = GnssFix{};
   status_ = "GNSS idle";
 }

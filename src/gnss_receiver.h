@@ -22,6 +22,7 @@ class GnssReceiver {
   const std::string& modemInfo() const { return modem_info_; }
   const std::string& apiInfo() const { return api_info_; }
   unsigned nmeaCount() const { return nmea_count_; }
+  bool nmeaEnabled() const { return nmea_enabled_; }
 
  private:
   bool sendCommand(const char* command);
@@ -34,6 +35,7 @@ class GnssReceiver {
   std::string modem_info_;
   std::string api_info_;
   unsigned nmea_count_ = 0;
+  bool nmea_enabled_ = false;
   GnssFix fix_;
   gpiod_chip* enable_chip_ = nullptr;
   gpiod_line_request* enable_request_ = nullptr;

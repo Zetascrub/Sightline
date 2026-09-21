@@ -897,6 +897,15 @@ device, the deployed UI reported `RUNNING yes` and `Legacy GPS active; waiting
 for position report` after `gnss start`. An outdoor position fix remains to be
 verified.
 
+During a later window test, the live modem still reported `#XGPS: 1,1`
+(legacy GPS active) but no position notification. This firmware rejects
+`AT#XNMEA=1`, so `NMEA_COUNT 0` and the initialized satellite count of zero
+do **not** prove that no satellites are visible; the modem provides no
+intermediate satellite telemetry through this UART path. The LOCATION screen
+now says the satellite count is unavailable when NMEA is disabled, and the
+runtime status includes `NMEA_ENABLED`. A clear open-sky test is needed to
+separate window signal loss from an RF/antenna problem.
+
 `src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
 coordinate helpers were split out of `gnss_receiver.cpp` into their own
 files with no libgpiod dependency. This wasn't a style preference - once

@@ -297,6 +297,7 @@ void writeGnssRuntimeStatus() {
       << "FIX " << (fix.valid ? "yes" : "no") << '\n'
       << "SATELLITES " << fix.satellites << '\n';
   out << "NMEA_COUNT " << g_gnss.nmeaCount() << '\n'
+      << "NMEA_ENABLED " << (g_gnss.nmeaEnabled() ? "yes" : "no") << '\n'
       << "LAST_RESPONSE " << g_gnss.lastResponse() << '\n'
       << "MODEM_INFO " << g_gnss.modemInfo() << '\n'
       << "API_INFO " << g_gnss.apiInfo() << '\n';
@@ -1692,7 +1693,8 @@ void refreshLiveDetails(lv_timer_t*) {
               << "\nUTC          " << fix.utc;
     } else if (running) {
       details << "No position yet\n"
-              << "Satellites: " << fix.satellites << "  //  NMEA: " << g_gnss.nmeaCount()
+              << (g_gnss.nmeaEnabled() ? "Satellites: " + std::to_string(fix.satellites)
+                                       : "Satellite count unavailable on this modem")
               << "\nMove outdoors with a clear sky view. A cold fix may take several minutes.";
     } else if (failed) {
       details << g_gnss.status() << "\nTap Retry GNSS to try again.";
