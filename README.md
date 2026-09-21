@@ -876,6 +876,15 @@ the protocol), since that needs either open sky or a much longer indoor
 window than was tested, and pressing the on-screen "Start GNSS" button is
 a physical/UI step, not something drivable over SSH.
 
+Follow-up: the LOCATION button still called an older `enableNrf9151()` helper
+before `GnssReceiver::start()`. Both requested gpiochip0 line 2 exclusively,
+so the receiver's request would fail after the button's request succeeded.
+Removed the duplicate UI request and its shutdown cleanup; the receiver now
+owns the enable line for the entire GNSS session. Also updated the Settings
+row, which still claimed GNSS required new modem firmware. The corrected UI
+build was deployed and restarted successfully; a live fix still needs an
+outdoor test.
+
 `src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
 coordinate helpers were split out of `gnss_receiver.cpp` into their own
 files with no libgpiod dependency. This wasn't a style preference - once

@@ -17,7 +17,6 @@
 #include "lvgl/src/misc/cache/instance/lv_image_cache.h"
 #include "lvgl/src/drivers/display/drm/lv_linux_drm.h"
 #include "lvgl/src/drivers/evdev/lv_evdev.h"
-#include <gpiod.h>
 
 extern "C" {
 // Not declared in the upstream LVGL header above: Canaan/LILYGO's own
@@ -240,31 +239,6 @@ struct BatteryState {
   int charge_current_ma = 0;
 };
 BatteryState g_battery;
-gpiod_chip* g_nrf9151_gpio_chip = nullptr;
-gpiod_line_request* g_nrf9151_enable_request = nullptr;
-
-bool enableNrf9151() {
-  if (g_nrf9151_enable_request != nullptr) return true;
-  g_nrf9151_gpio_chip = gpiod_chip_open("/dev/gpiochip0");
-  if (g_nrf9151_gpio_chip == nullptr) return false;
-  gpiod_line_settings* settings = gpiod_line_settings_new();
-  gpiod_line_config* lines = gpiod_line_config_new();
-  gpiod_request_config* request = gpiod_request_config_new();
-  constexpr unsigned int kEnableOffset = 2;
-  if (settings == nullptr || lines == nullptr || request == nullptr) return false;
-  gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
-  gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_ACTIVE);
-  gpiod_line_config_add_line_settings(lines, &kEnableOffset, 1, settings);
-  gpiod_request_config_set_consumer(request, "reconclave-nrf9151");
-  g_nrf9151_enable_request = gpiod_chip_request_lines(g_nrf9151_gpio_chip, request, lines);
-  gpiod_line_settings_free(settings);
-  gpiod_line_config_free(lines);
-  gpiod_request_config_free(request);
-  if (g_nrf9151_enable_request == nullptr) return false;
-  usleep(600000);
-  return true;
-}
-
 int estimateLithiumPercent(int millivolts) {
   struct Point { int mv; int percent; };
   static constexpr Point curve[] = {
@@ -2451,8 +2425,7 @@ lv_obj_t* buildLocationScreen(lv_obj_t* home) {
   lv_obj_add_event_cb(start_button, [](lv_event_t*) {
     std::string error;
     if (!g_gnss.running()) {
-      if (!enableNrf9151()) error = "unable to enable nRF9151 on GPIO2";
-      else g_gnss.start("/dev/ttyS3", error);
+      g_gnss.start("/dev/ttyS3", error);
     }
     if (!error.empty() && g_gnss_details != nullptr) {
       lv_label_set_text(g_gnss_details, error.c_str());
@@ -3224,7 +3197,7 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
   lv_obj_set_style_text_font(bluetooth_status, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(bluetooth_status, lv_color_hex(kColorSecondary), 0);
   lv_obj_align(bluetooth_status, LV_ALIGN_RIGHT_MID, 0, 0);
-  addSettingsRow(list, LV_SYMBOL_GPS, "Location", "GNSS unavailable - modem firmware required",
+  addSettingsRow(list, LV_SYMBOL_GPS, "Location", "GNSS receiver and evidence geotagging",
                  location_screen);
 
   addSettingsSection(list, "Display & hardware", "Backlight");
@@ -3885,7 +3858,5 @@ int main() {
   // which screen was active.
   stopPreviewWorker();
   if (g_wifi_op_thread.joinable()) g_wifi_op_thread.join();
-  if (g_nrf9151_enable_request != nullptr) gpiod_line_request_release(g_nrf9151_enable_request);
-  if (g_nrf9151_gpio_chip != nullptr) gpiod_chip_close(g_nrf9151_gpio_chip);
   return 0;
 }
