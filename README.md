@@ -113,22 +113,45 @@ Reconclave's own trust bootstrap (milestone 9 below).
 
 ### Autostart
 
-`reconclave_k230` autostarts on boot via `/etc/init.d/S90reconclave`
-(installed directly on the device over SSH, not tracked in this repo — a
-plain busybox init script mirroring `/etc/init.d/S99zz_k230_phone_ui`'s own
-start/stop pattern). Confirmed surviving real reboots — **twice** on the
-first attempt, since the app itself had a real bug: it start checking for a
-non-loopback IPv4 address immediately, but `S90reconclave` runs right after
-`S40network` brings the interface up, before DHCP (`udhcpc`, backgrounded)
-has actually completed - the app would see no address yet and exit. Fixed
-in `main.cpp` by retrying for up to 20 seconds instead of checking once,
-matching the same wait-and-retry pattern `S99zz_k230_phone_ui`'s own script
-already uses for `/dev/dri/card0`. `reconclave_k230_ui` (the touch UI) does
-**not** autostart yet — it's been run manually over SSH each time so far,
-since it and `k230_phone_ui` both want the DRM display and would conflict;
-making the UI app autostart (and deciding whether it replaces
-`k230_phone_ui` outright, matching this device's Cardputer-equivalent
-"the device IS the app" model) is unstarted follow-up work.
+Both `reconclave_k230` (installed on-device as `/usr/bin/reconclave-k230-node`)
+and `reconclave_k230_ui` (`/usr/bin/reconclave-k230-ui`) now autostart via
+`/etc/init.d/S90reconclave-node` and `/etc/init.d/S99reconclave-ui`
+respectively - tracked in this repo at
+`firmware/rootfs-overlay/etc/init.d/` (this section previously described an
+older `S90reconclave` name and claimed the UI still needed manual starts;
+both were stale - the device has moved on since). `S90reconclave-node`
+confirmed surviving real reboots — **twice** on the first attempt, since the
+app itself had a real bug: it started checking for a non-loopback IPv4
+address immediately, but the init script runs right after `S40network`
+brings the interface up, before DHCP (`udhcpc`, backgrounded) has actually
+completed - the app would see no address yet and exit. Fixed in `main.cpp`
+by retrying for up to 20 seconds instead of checking once, matching the
+same wait-and-retry pattern `S99zz_k230_phone_ui`'s own script already uses
+for `/dev/dri/card0`.
+
+**Both init scripts had a real bug of their own, found and fixed**: each
+used `start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- >>"$LOGFILE" 2>&1`,
+which looks like it redirects the daemon's stdout/stderr into `$LOGFILE` but
+does not - `-b` backgrounds and detaches the daemon's own stdio as part of
+daemonizing, independently of whatever fds the parent shell had redirected,
+so the shell-level `>>` only ever captured `start-stop-daemon`'s own
+output, never the daemon's. Both `$LOGFILE`s were **silently empty in
+production the entire time**, regardless of what either binary printed -
+not a buffering issue (though see below), a detachment one. Fixed by using
+BusyBox's dedicated `-O "$LOGFILE"` flag instead, which makes
+`start-stop-daemon` itself append the daemon's real stdout/stderr.
+Confirmed fixed on real hardware: `reconclave-k230-ui`'s log now shows its
+own startup lines including live keyboard/battery status, and
+`reconclave-k230-node`'s shows its device-id/port and shutdown lines.
+
+Separately, `main.cpp` and `ui_app.cpp` had a handful of `std::printf()`
+startup diagnostics going to `stdout` instead of `stderr`, unlike every
+other diagnostic in both files - harmless when stdout is a tty, but
+fully-buffered once redirected to a regular file, so those specific lines
+would still never reach the log even after the `-O` fix, sitting in the
+buffer until the process happened to exit. Switched to `std::fprintf(stderr, ...)`
+to match the rest of both files' convention. Both bugs were compounding:
+either alone still left the log empty.
 
 ## Build (once the toolchain is on PATH)
 
@@ -288,11 +311,14 @@ on the device's existing rootfs.
    layouts, so `ui_shell.cpp`'s `createTileGrid()`/`createTile()` use
    `LV_FLEX_FLOW_ROW_WRAP` with an explicitly computed fixed tile size
    instead - confirmed correct via the same diagnostic logging, then
-   visually. The SDK configuration used for this UI compiles LVGL system
-   monitoring out (`LV_USE_SYSMON=0`), which also disables the vendor
-   `LV_USE_PERF_MONITOR` overlay. Do not call the vendor-only
-   `lv_sysmon_hide_performance()` symbol: clean SDK builds may leave that
-   optional weak symbol unresolved, causing a null-function call at startup.
+   visually. Correction from the now-confirmed real `lv_conf.defaults` (see
+   "Device sysroot" below): `LV_USE_SYSMON` is actually `1` on this device,
+   only `LV_USE_PERF_MONITOR` is `0` - this section originally guessed
+   SYSMON itself was off, inferred indirectly from the symbol issue below
+   rather than read from the real config. Do not call the vendor-only
+   `lv_sysmon_hide_performance()` symbol regardless: clean SDK builds may
+   leave that optional weak symbol unresolved, causing a null-function call
+   at startup.
 7. **Perception.** Camera capture, OCR, object detection via the vendor KPU
    runtime. `/dev/video0`-`video4` plus dedicated ISP/VPU device nodes
    confirmed present.
@@ -679,6 +705,69 @@ after realigning were not - don't chase a "still wrong" diagnostic
 number after fixing something that's provably a static/`_size`-based
 property; verify position-related fixes visually instead.
 
+## Keyboard-driven navigation
+
+Milestone 4/6 above already had most of this working: `main()` creates an
+`lv_group_t` and calls `lv_group_set_default()` before any screen is built,
+so every focusable widget on all 18 screens auto-joins it; an
+`LV_INDEV_TYPE_KEYPAD` indev is wired to the TCA8418 via
+`pollHardwareKeyboard()`/`readHardwareKeyboard()`; Esc dispatches directly to
+`activateScreenBackButton()`; letters/numbers/symbols (with shift/caps
+state) feed focused textareas. The Cardputer-parity table's "Not started"
+row for this was simply never updated once that landed.
+
+**Confirmed on real hardware and one real gap found**: Esc/back worked
+immediately. Arrow keys did nothing - confirmed by operator testing, not
+guessed. Root cause: LVGL's keypad indev only treats `LV_KEY_NEXT`/`LV_KEY_PREV`
+as group-navigation triggers by default (mapped here to one specific
+physical key, code 6); `LV_KEY_UP`/`DOWN`/`LEFT`/`RIGHT` are just forwarded
+to whichever widget is currently focused as a plain key event, and a bare
+button or tile has no built-in reaction to them - only widgets with their
+own key handling (a slider adjusting its value, a textarea moving its
+cursor) do anything with them. A plain focus grid of tiles, which is what
+most of this app's screens are, silently swallowed every arrow press.
+
+Fixed in `pollHardwareKeyboard()` (`ui_app.cpp`): arrow keys are now
+redirected to `lv_group_focus_next()`/`lv_group_focus_prev()` (right/down =
+next, left/up = prev) *unless* the currently focused widget is an
+`lv_slider` or `lv_textarea` (checked via `lv_obj_check_type()` against
+`lv_slider_class`/`lv_textarea_class`), in which case the raw key still
+reaches the widget so the brightness slider and the password/session text
+fields keep their native arrow-key behavior. `g_keyboard_group` was made a
+global (previously a `main()`-local) so the poll callback can reach it.
+
+## Device sysroot: the correct `lv_conf.h` recipe
+
+`fetch-device-sysroot.sh` previously fetched
+`kendryte/k230_sdk`'s `.../lvgl/port_src/lv_conf.h` as "the" LVGL config -
+that path is a stale **v8.2.0** config, silently wrong for this device's
+real **v9.5.0** `liblvgl.so` (a mismatch here has crashed this exact app
+before - see the boot-splash section's unrelated but similarly-shaped
+lesson about not trusting an unverified source). The real, confirmed-working
+recipe, now scripted in `fetch-device-sysroot.sh` itself: LVGL source is
+pinned by LILYGO's own BSP overlay
+(`Xinyuan-LilyGO/T-Display-K230`'s `k230_bsp/overlay/.../lvgl/lvgl.mk`) at
+the exact commit `59dc7e436ae97a25e32656739ea6a943f9f11b6a` in upstream
+`lvgl/lvgl` (not a release tag); that same overlay carries this device's
+`lv_conf.defaults` (board value overrides) and the patch that's the actual
+source of the `lv_linux_drm_set_rotation` symbol documented above; `lv_conf.h`
+itself is *generated*, not copied, via LVGL's own
+`scripts/generate_lv_conf.py` against that commit's `lv_conf_template.h` +
+the overlay's `lv_conf.defaults` - reproducing exactly what the overlay's
+own `CMakeLists.txt` does at build time. libgpiod (needed for the TCA8418's
+bit-banged I2C, previously missing from this script entirely) is fetched
+the same way as libdrm - a close v2.x tag's `gpiod.h`, verified against
+every `gpiod_*` symbol this codebase actually calls, plus the real
+`libgpiod.so` pulled from the device.
+
+Rebuilding `reconclave_k230_ui` against this reconstructed sysroot and
+smoke-testing it standalone on real hardware (while the old process still
+held the DRM/GPIO devices) produced exactly the expected resource-busy
+conflicts and *no* crash or undefined-symbol error - strong evidence the
+generated config is correct, since a mismatch here has previously crashed
+`lv_init()` outright rather than failing gracefully later. Deployed and
+confirmed stable post-swap.
+
 ## Home screen: 10 tiles, 5x2
 
 `main()`'s tile grid is `createTileGrid(home, 5, 2)`: NETWORK, WIRELESS,
@@ -705,7 +794,7 @@ against real K230 hardware rather than assumed:
 | Evidence CSV export | Done | Not a removable microSD like Cardputer - see milestone 6 |
 | BLE discovery | Blocked | Driver issue, see milestone 8 above |
 | Touchscreen UI | Done | Milestone 6 - §18 mockup, landscape, touch navigation |
-| Keyboard-driven navigation | Not started | TCA8418 is on the keyboard base's I2C4 bus; the current BSP exposes this hardware, but LVGL navigation integration remains |
+| Keyboard-driven navigation | Done | See "Keyboard-driven navigation" below - this row was stale, milestone 4/6 had already wired most of it |
 | GNSS / cellular | Implemented; hardware validation pending | Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, starts LILYGO's Serial LTE Modem GNSS sequence, validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. Cellular assessment tools remain |
 | Assessment sessions | Done | Persistent project, engagement and operator context is editable on-device and embedded into exported observations |
 | Node/job dashboard | Done | Local UI shows trust state, node address, capability count and live remote discovery progress/findings through an atomic runtime-status channel |

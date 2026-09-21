@@ -14,8 +14,13 @@ start() {
 	done
 	[ -e "$DRM_NODE" ] || { echo 'no DRM'; return 0; }
 	mkdir -p /root/reconclave/evidence /var/run /var/log
-	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- \
-		>>"$LOGFILE" 2>&1
+	# -O, not a plain shell redirect: start-stop-daemon -b backgrounds and
+	# detaches the daemon's own stdio, so a `>>"$LOGFILE" 2>&1` wrapped
+	# around this line only ever captured start-stop-daemon's own output,
+	# never the daemon's - LOGFILE was silently empty in production
+	# regardless of what the daemon printed. -O makes start-stop-daemon
+	# itself append the daemon's stdout/stderr to LOGFILE.
+	start-stop-daemon -S -b -m -p "$PIDFILE" -O "$LOGFILE" -x "$DAEMON"
 	echo OK
 }
 

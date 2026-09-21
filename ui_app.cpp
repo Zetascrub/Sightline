@@ -208,6 +208,7 @@ reconclave::Tca8418Keyboard g_keyboard;
 bool g_keyboard_ready = false;
 bool g_keyboard_shift = false;
 bool g_keyboard_caps = false;
+lv_group_t* g_keyboard_group = nullptr;
 std::vector<std::pair<std::string, lv_obj_t*>> g_ui_screens;
 
 struct QueuedKey {
@@ -843,6 +844,26 @@ void pollHardwareKeyboard(lv_timer_t*) {
     const std::uint32_t key = keyboardKeyForCode(code);
     if (key == 0) return;
     if (key == LV_KEY_ESC && activateScreenBackButton()) return;
+    // LVGL's keypad indev only treats LV_KEY_NEXT/PREV as group-navigation
+    // triggers by default; a plain focusable tile/button/row has no
+    // built-in reaction to LV_KEY_UP/DOWN/LEFT/RIGHT, so without this they
+    // are silently swallowed - confirmed on hardware (ESC/back worked via
+    // activateScreenBackButton() above, arrows did nothing). Redirect them
+    // to group focus movement instead, except for the widgets that
+    // legitimately want raw arrow keys for their own purpose (the
+    // brightness slider's value, a textarea's cursor position).
+    if (g_keyboard_group != nullptr &&
+        (key == LV_KEY_UP || key == LV_KEY_DOWN || key == LV_KEY_LEFT || key == LV_KEY_RIGHT)) {
+      lv_obj_t* focused = lv_group_get_focused(g_keyboard_group);
+      const bool wants_raw_arrows = focused != nullptr &&
+          (lv_obj_check_type(focused, &lv_slider_class) ||
+           lv_obj_check_type(focused, &lv_textarea_class));
+      if (!wants_raw_arrows) {
+        if (key == LV_KEY_DOWN || key == LV_KEY_RIGHT) lv_group_focus_next(g_keyboard_group);
+        else lv_group_focus_prev(g_keyboard_group);
+        return;
+      }
+    }
     if (g_keyboard_queue.size() > 48) g_keyboard_queue.pop_front();
     g_keyboard_queue.push_back({key, LV_INDEV_STATE_PRESSED});
     g_keyboard_queue.push_back({key, LV_INDEV_STATE_RELEASED});
@@ -3694,12 +3715,18 @@ int main() {
   // driver and widget updates remain single-threaded and race-free.
   lv_group_t* keyboard_group = lv_group_create();
   lv_group_set_default(keyboard_group);
+  g_keyboard_group = keyboard_group;
   lv_indev_t* keyboard_indev = lv_indev_create();
   lv_indev_set_type(keyboard_indev, LV_INDEV_TYPE_KEYPAD);
   lv_indev_set_read_cb(keyboard_indev, readHardwareKeyboard);
   lv_indev_set_group(keyboard_indev, keyboard_group);
   g_keyboard_ready = g_keyboard.start();
-  std::printf("reconclave k230 keyboard: %s\n", g_keyboard_ready ? "ready" : "not detected");
+  // stderr, not stdout: stdout is fully buffered once redirected to the
+  // init script's LOGFILE, so a std::printf() here would sit in the
+  // buffer and never actually reach the log before the process exits -
+  // matching every other startup diagnostic in this file (see DRM/battery
+  // messages above).
+  std::fprintf(stderr, "reconclave k230 keyboard: %s\n", g_keyboard_ready ? "ready" : "not detected");
 
   using namespace reconclave::ui;
 
@@ -3840,7 +3867,7 @@ int main() {
   lv_timer_create(pollHardwareKeyboard, 25, nullptr);
   lv_screen_load(home);
 
-  std::printf("reconclave k230 ui: running\n");
+  std::fprintf(stderr, "reconclave k230 ui: running\n");
   std::fflush(stdout);
   while (g_running) {
     lv_timer_handler();

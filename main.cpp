@@ -479,7 +479,7 @@ int main() {
     std::fprintf(stderr, "no non-loopback IPv4 address found after waiting\n");
     return 1;
   }
-  std::printf("reconclave k230: device_id=%s ip=%s http_port=%u\n", kDeviceId, local_ip.c_str(), kHttpPort);
+  std::fprintf(stderr, "reconclave k230: device_id=%s ip=%s http_port=%u\n", kDeviceId, local_ip.c_str(), kHttpPort);
 
   reconclave::HttpServer http;
   if (!http.listen(kHttpPort)) {
@@ -694,8 +694,8 @@ int main() {
     return response;
   };
 
-  std::printf("reconclave k230: serving %s and %s, mDNS on %s._reconclave._tcp.local.\n", kAnnouncePath,
-              kMessagePath, kDeviceId);
+  std::fprintf(stderr, "reconclave k230: serving %s and %s, mDNS on %s._reconclave._tcp.local.\n", kAnnouncePath,
+               kMessagePath, kDeviceId);
   writeRuntimeStatus(trust, announcement, discovery.snapshot(), local_ip,
                      host_knowledge.snapshot().size());
   std::uint64_t next_status_write = nowMillis() + 1000;
@@ -801,7 +801,7 @@ int main() {
     }
   }
 
-  std::printf("reconclave k230: shutting down\n");
+  std::fprintf(stderr, "reconclave k230: shutting down\n");
   mdns.goodbye();
   return 0;
 }
