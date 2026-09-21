@@ -1,6 +1,7 @@
 #include "ui_shell.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -21,13 +22,82 @@ struct StatusRefs {
 };
 
 std::vector<StatusRefs> g_status_bars;
+lv_group_t* g_nav_group = nullptr;
+
+// This app never applies an LVGL theme (no lv_theme_default_init()/
+// lv_display_set_theme() call anywhere) - every visual is this app's own
+// explicit style, so there is no default focus indicator to fall back on.
+// Applied with the LV_STATE_FOCUSED selector below, which LVGL toggles on
+// an object automatically as group focus moves onto/off of it - no manual
+// add/remove synchronization needed, this style just activates itself.
+lv_style_t g_focus_style;
+bool g_focus_style_ready = false;
+
+void ensureFocusStyle() {
+  if (g_focus_style_ready) return;
+  lv_style_init(&g_focus_style);
+  lv_style_set_outline_width(&g_focus_style, 3);
+  lv_style_set_outline_color(&g_focus_style, lv_color_hex(kColorAccent));
+  lv_style_set_outline_opa(&g_focus_style, LV_OPA_COVER);
+  lv_style_set_outline_pad(&g_focus_style, 2);
+  g_focus_style_ready = true;
+}
+
+// Recursively adds every genuinely-interactive descendant of `obj` to
+// `group`, so a screen's tiles/buttons/fields become keyboard-navigable
+// regardless of how deeply they're nested in layout containers.
+//
+// Deliberately checks widget *class*, not LV_OBJ_FLAG_CLICK_FOCUSABLE:
+// lv_obj's base constructor sets that flag on every object by default
+// (lv_obj.c), and lv_label only clears LV_OBJ_FLAG_CLICKABLE, not
+// CLICK_FOCUSABLE - so a flag check adds every decorative label/icon
+// inside a card (title, detail, badge, the "01"/"02" index, the symbol
+// glyph) as its own navigation stop alongside the real button, and every
+// plain lv_obj_create() layout wrapper (the card itself, row/column
+// containers, ...) too, since those never had the flag cleared either.
+// Confirmed on real hardware as the reason arrow-key focus wasn't visibly
+// landing on anything sensible even after group membership was correctly
+// scoped to the active screen - it was moving, just between dozens of
+// non-visual targets. lv_obj_has_class() (not lv_obj_check_type(), which
+// is an exact match only) also picks up lv_list's row buttons, since
+// lv_list_button_class's base_class is lv_button_class.
+bool isNavigable(lv_obj_t* obj) {
+  return lv_obj_has_class(obj, &lv_button_class) ||
+         lv_obj_has_class(obj, &lv_textarea_class) ||
+         lv_obj_has_class(obj, &lv_slider_class);
+}
+
+void addFocusableDescendants(lv_group_t* group, lv_obj_t* obj) {
+  const std::uint32_t count = lv_obj_get_child_count(obj);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    lv_obj_t* child = lv_obj_get_child(obj, static_cast<std::int32_t>(i));
+    if (isNavigable(child)) {
+      lv_group_add_obj(group, child);
+      ensureFocusStyle();
+      lv_obj_add_style(child, &g_focus_style, LV_STATE_FOCUSED);
+    }
+    addFocusableDescendants(group, child);
+  }
+}
+
+void onScreenLoaded(lv_event_t* event) {
+  if (g_nav_group == nullptr) return;
+  // Clears the *group's* membership list, not the screens or widgets
+  // themselves - safe to call on every navigation, and is what actually
+  // confines arrow-key/next-key focus movement to the screen now visible.
+  lv_group_remove_all_objs(g_nav_group);
+  addFocusableDescendants(g_nav_group, static_cast<lv_obj_t*>(lv_event_get_target(event)));
+}
 }  // namespace
+
+void setKeyboardGroup(lv_group_t* group) { g_nav_group = group; }
 
 lv_obj_t* createScreen() {
   lv_obj_t* screen = lv_obj_create(nullptr);
   lv_obj_set_style_bg_color(screen, lv_color_hex(kColorPanel), 0);
   lv_obj_set_style_pad_all(screen, 0, 0);
   lv_obj_set_style_border_width(screen, 0, 0);
+  lv_obj_add_event_cb(screen, onScreenLoaded, LV_EVENT_SCREEN_LOADED, nullptr);
   return screen;
 }
 

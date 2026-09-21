@@ -736,6 +736,63 @@ reaches the widget so the brightness slider and the password/session text
 fields keep their native arrow-key behavior. `g_keyboard_group` was made a
 global (previously a `main()`-local) so the poll callback can reach it.
 
+**Two more real bugs found redeploying this fix, in the same session -
+each looked fixed after the previous one but wasn't, all three confirmed
+against actual operator testing, not assumed:**
+
+1. **Wrong screen scope.** `lv_group_set_default()` is called once, before
+   any of the 18 screens are built, so *every* focusable widget across
+   *every* screen ends up in the same single group, in whole-app creation
+   order. Pressing an arrow key on the home screen genuinely moved group
+   focus - just onto a widget belonging to a completely different, hidden
+   screen (home's own tiles are built last, after all 17 other screens),
+   so nothing visible ever changed. Fixed by rescoping group membership to
+   just the active screen: `createScreen()` (`src/ui_shell.cpp`) now
+   registers an `LV_EVENT_SCREEN_LOADED` handler that calls
+   `lv_group_remove_all_objs()` then walks that screen's descendant tree
+   adding only its own widgets back in - since every screen goes through
+   this one shared helper, no per-screen wiring was needed.
+   `setKeyboardGroup()` (new, `ui_shell.h`) lets `main()` hand the group to
+   `ui_shell.cpp` once.
+2. **Wrong descendant filter.** The first attempt at that same
+   `LV_EVENT_SCREEN_LOADED` walk added anything with
+   `LV_OBJ_FLAG_CLICK_FOCUSABLE` set - which turned out to be nearly every
+   object in the tree, not just the real interactive ones:
+   `lv_obj`'s base constructor sets that flag on *every* object by
+   default (`lv_obj.c`), and `lv_label` only clears
+   `LV_OBJ_FLAG_CLICKABLE`, never `CLICK_FOCUSABLE`. So the group ended up
+   correctly scoped to the active screen but stuffed with every decorative
+   label/icon inside each card (title, detail, badge, the "01"/"02" index,
+   the symbol glyph) plus every plain `lv_obj_create()` layout wrapper,
+   diluting navigation across dozens of non-visual stops instead of the
+   handful of real ones - still looked like "nothing happens" from the
+   operator's seat. Fixed by checking widget *class* instead
+   (`lv_obj_has_class()`, which walks the base-class chain, against
+   `lv_button_class`/`lv_textarea_class`/`lv_slider_class` - `has_class`
+   rather than the exact-match `lv_obj_check_type()` specifically so
+   `lv_list`'s row buttons are included too, since `lv_list_button_class`'s
+   base class is `lv_button_class`).
+3. **No visible focus indicator at all.** Even with group membership
+   finally correct, arrow-key presses still weren't visibly doing
+   anything - because this app never applies an LVGL theme anywhere
+   (`lv_theme_default_init()`/`lv_display_set_theme()` are never called),
+   so every visual is this app's own explicit style and nothing styles the
+   focused state for buttons (only the textareas' border does). Fixed by
+   adding one shared `lv_style_t` (a 3px accent-colored outline) applied
+   with the `LV_STATE_FOCUSED` selector to every widget as it's added to
+   the group - LVGL toggles that state on an object automatically as group
+   focus moves onto/off of it, so this needed no manual add/remove
+   synchronization, just applying the style once per widget
+   (`lv_obj_add_style()` already dedupes repeat calls, confirmed by
+   reading its source, so re-visiting a screen many times in a long-running
+   session doesn't accumulate anything).
+
+Confirmed working end-to-end by the operator on real hardware after all
+three fixes: a visible outline appears on a home tile as soon as the
+screen loads (the first object added to a freshly-emptied group is
+auto-focused - confirmed by reading `lv_group_add_obj()`'s source, not
+assumed), and arrow keys move it between real tiles/buttons.
+
 ## Device sysroot: the correct `lv_conf.h` recipe
 
 `fetch-device-sysroot.sh` previously fetched

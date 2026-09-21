@@ -45,8 +45,23 @@ constexpr lv_coord_t kContentTop =
 enum class TileState { Live, Unavailable };
 
 // Builds a screen with the standard dark panel background, common to every
-// screen this app shows (home and each capability screen alike).
+// screen this app shows (home and each capability screen alike). Also
+// registers this screen for keyboard-group rescoping - see
+// setKeyboardGroup() - so every screen this app builds through the normal
+// path participates automatically, with no per-screen wiring needed.
 lv_obj_t* createScreen();
+
+// The keyboard-nav group set here is treated as app-global (one physical
+// keypad, one focus target at a time) but its *membership* is rescoped to
+// just the active screen's focusable widgets every time a screen created
+// by createScreen() loads - a single group spanning every screen (LVGL's
+// default-group auto-add behavior, which is what happens without this)
+// means arrow-key navigation on one screen can move focus onto an object
+// belonging to a completely different, invisible screen: confirmed on
+// real hardware as "arrow keys don't visibly do anything," since focus
+// was genuinely moving, just never onto anything on screen. Call once,
+// after creating the group and before building any screens.
+void setKeyboardGroup(lv_group_t* group);
 
 // Builds a small top-left "< back" button on `screen` that switches to
 // `home_screen` when tapped - every non-home screen gets exactly one of

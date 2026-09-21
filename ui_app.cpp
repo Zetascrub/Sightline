@@ -3716,6 +3716,7 @@ int main() {
   lv_group_t* keyboard_group = lv_group_create();
   lv_group_set_default(keyboard_group);
   g_keyboard_group = keyboard_group;
+  reconclave::ui::setKeyboardGroup(keyboard_group);
   lv_indev_t* keyboard_indev = lv_indev_create();
   lv_indev_set_type(keyboard_indev, LV_INDEV_TYPE_KEYPAD);
   lv_indev_set_read_cb(keyboard_indev, readHardwareKeyboard);
