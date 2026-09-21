@@ -278,7 +278,9 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
         state.find("#XGNSS: 1") != std::string::npos;
     if (!modern_active) {
       // Nordic Serial LTE Modem releases through NCS 3.1 called this API XGPS.
-      legacy_gps = legacy_supported && exchange("AT#XGPS=1,0,0,0", 3000, response);
+      // Interval 1 keeps navigation running after the first fix; interval 0
+      // would put the modem to sleep after one position report (#XGPS: 1,4).
+      legacy_gps = legacy_supported && exchange("AT#XGPS=1,0,1", 3000, response);
       legacy_failure = response;
       if (legacy_supported && !legacy_gps) {
         std::string gps_state;
@@ -286,7 +288,7 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
             gps_state.find("#XGPS: 1,") != std::string::npos;
         if (!legacy_gps) {
           usleep(300000);
-          legacy_gps = exchange("AT#XGPS=1,0,0,0", 3000, response);
+          legacy_gps = exchange("AT#XGPS=1,0,1", 3000, response);
           if (!legacy_gps) legacy_failure = response;
         }
       }
@@ -298,19 +300,19 @@ bool GnssReceiver::start(const std::string& device, std::string& error) {
         if (exchange("AT+CFUN=0", 6000, recovery) &&
             exchange("AT%XSYSTEMMODE=1,0,1,0", 3000, recovery) &&
             exchange("AT+CFUN=1", 9000, recovery)) {
-          legacy_gps = exchange("AT#XGPS=1,0,0,0", 3000, response);
+          legacy_gps = exchange("AT#XGPS=1,0,1", 3000, response);
           if (!legacy_gps) legacy_failure = response;
         }
       }
     }
     if (!modern_active && !legacy_gps) {
-      error = "AT#XGPS=1,0,0,0 rejected: " + legacy_failure;
+      error = "AT#XGPS=1,0,1 rejected: " + legacy_failure;
       const std::string diagnosis = error;
       stop(); status_ = "GNSS error: " + diagnosis; return false;
     }
   }
   status_ = nmea_enabled ? "GNSS started; waiting for satellite fix" :
-      legacy_gps ? "Legacy GPS active; waiting for position report" :
+      legacy_gps ? "Continuous GPS active; waiting for position report" :
       "GNSS active; waiting for position report";
   error.clear();
   return true;

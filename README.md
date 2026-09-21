@@ -913,6 +913,17 @@ the test does not isolate which earlier physical factor blocked reception.
 Satellite count remains unavailable on the installed firmware because NMEA
 output is rejected.
 
+Continuous tracking follow-up: the original legacy command
+`AT#XGPS=1,0,0,0` requested one fix. The modem then emitted `#XGPS: 1,4`
+and slept, even though the UART session remained open. Toggling GNSS off and
+on cleared that fix and began a new search; an outdoor restart did acquire a
+second valid fix after a few minutes. The UI now requests documented
+continuous mode with `AT#XGPS=1,0,1`. The deployed modem accepted the command
+and sent multiple subsequent position reports with advancing UTC timestamps
+and changing coordinates. The Location screen therefore remains in **FIX
+ACQUIRED** with live updates until the operator stops GNSS. Restarting still
+starts in **SEARCHING FOR FIX** until the next position arrives.
+
 `src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
 coordinate helpers were split out of `gnss_receiver.cpp` into their own
 files with no libgpiod dependency. This wasn't a style preference - once
@@ -984,7 +995,7 @@ against real K230 hardware rather than assumed:
 | BLE discovery | Done locally | nRF52840 UART BLE scan is proven on hardware and available from the Bluetooth screen; no BlueZ HCI adapter is present |
 | Touchscreen UI | Done | Milestone 6 - §18 mockup, landscape, touch navigation |
 | Keyboard-driven navigation | Done | See "Keyboard-driven navigation" below - this row was stale, milestone 4/6 had already wired most of it |
-| GNSS / cellular | GNSS fix confirmed outdoors; cellular assessment remains | See "GNSS: the modem was just never powered on" below. Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, drives the modem's enable GPIO, starts the legacy `#XGPS` sequence (this firmware doesn't support the modern `#XGNSS` API), validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. The ceramic GNSS patch must face open sky. Satellite count is unavailable with the installed firmware. |
+| GNSS / cellular | Continuous GNSS fixes confirmed outdoors; cellular assessment remains | See "GNSS: the modem was just never powered on" below. Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, drives the modem's enable GPIO, starts legacy `#XGPS` continuous tracking (this firmware doesn't support the modern `#XGNSS` API), validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. The ceramic GNSS patch must face open sky. Satellite count is unavailable with the installed firmware. |
 | Assessment sessions | Done | Persistent project, engagement and operator context is editable on-device and embedded into exported observations |
 | Node/job dashboard | Done | Local UI shows trust state, node address, capability count and live remote discovery progress/findings through an atomic runtime-status channel |
 | CC1101 sub-GHz, NFC | **Not applicable** | Cardputer-specific accessory hardware; no direct K230 equivalent |
