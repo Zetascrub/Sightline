@@ -73,6 +73,7 @@ void lv_linux_drm_set_rotation(lv_display_t* disp, int rotation);
 #include "src/ui_shell.h"
 #include "src/network_inventory.h"
 #include "src/gnss_receiver.h"
+#include "src/ble_bridge.h"
 #include "src/wifi_scanner.h"
 #include "src/evidence_store.h"
 #include "src/host_knowledge.h"
@@ -189,6 +190,12 @@ lv_obj_t* g_gnss_hint = nullptr;
 lv_obj_t* g_gnss_diagnostics = nullptr;
 lv_obj_t* g_gnss_action_label = nullptr;
 reconclave::GnssReceiver g_gnss;
+reconclave::BleBridge g_ble;
+lv_obj_t* g_ble_status = nullptr;
+lv_obj_t* g_ble_list = nullptr;
+lv_obj_t* g_ble_scan_button = nullptr;
+lv_obj_t* g_ble_disconnect_button = nullptr;
+std::uint64_t g_ble_rendered_generation = ~std::uint64_t{0};
 std::string g_project_id{"UNASSIGNED"};
 std::string g_engagement_id{"UNASSIGNED"};
 std::string g_operator_id{"LOCAL"};
@@ -311,12 +318,84 @@ void writeGnssRuntimeStatus() {
   if (out.good()) rename(temporary.c_str(), "/run/reconclave/gnss-status");
 }
 
+void writeBleRuntimeStatus() {
+  const std::string temporary = "/run/reconclave/ble-status.tmp";
+  std::ofstream out(temporary, std::ios::trunc);
+  if (!out) return;
+  out << "AVAILABLE " << (g_ble.available() ? "yes" : "no") << '\n'
+      << "STATUS " << g_ble.status() << '\n'
+      << "SCANNING " << (g_ble.scanning() ? "yes" : "no") << '\n'
+      << "CONNECTED " << (g_ble.connected() ? "yes" : "no") << '\n'
+      << "DEVICES " << g_ble.devices().size() << '\n'
+      << "VERSION " << g_ble.version() << '\n';
+  out.close();
+  if (out.good()) rename(temporary.c_str(), "/run/reconclave/ble-status");
+}
+
 void setGnssRunning(bool requested) {
   if (requested && !g_gnss.running()) {
     std::string error;
     g_gnss.start("/dev/ttyS3", error);
   } else if (!requested && g_gnss.running()) {
     g_gnss.stop();
+  }
+}
+
+void refreshBluetoothDetails(lv_timer_t*) {
+  g_ble.poll();
+  if (g_ble_status == nullptr || g_ble_rendered_generation == g_ble.generation()) return;
+  g_ble_rendered_generation = g_ble.generation();
+  std::string status = g_ble.status();
+  if (g_ble.available()) status += "  //  nRF52840 BLE";
+  if (!g_ble.devices().empty() && !g_ble.connected() && !g_ble.scanning() && !g_ble.connecting())
+    status += "  //  Tap a device to connect";
+  lv_label_set_text(g_ble_status, status.c_str());
+  if (g_ble.available() && !g_ble.scanning() && !g_ble.connecting() && !g_ble.connected())
+    lv_obj_clear_state(g_ble_scan_button, LV_STATE_DISABLED);
+  else lv_obj_add_state(g_ble_scan_button, LV_STATE_DISABLED);
+  if (g_ble.connected() || g_ble.connecting())
+    lv_obj_clear_state(g_ble_disconnect_button, LV_STATE_DISABLED);
+  else lv_obj_add_state(g_ble_disconnect_button, LV_STATE_DISABLED);
+
+  lv_obj_clean(g_ble_list);
+  for (const auto& device : g_ble.devices()) {
+    lv_obj_t* row = lv_obj_create(g_ble_list);
+    lv_obj_set_size(row, lv_pct(100), 70);
+    lv_obj_set_style_bg_color(row, lv_color_hex(reconclave::ui::kColorPanelLight), 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x21485a), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(row, lv_color_hex(reconclave::ui::kColorAccent), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_set_style_pad_all(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    if (g_keyboard_group != nullptr && lv_obj_get_screen(row) == lv_screen_active())
+      lv_group_add_obj(g_keyboard_group, row);
+    lv_obj_add_event_cb(row, [](lv_event_t* event) {
+      const int index = static_cast<int>(reinterpret_cast<std::uintptr_t>(
+          lv_event_get_user_data(event))) - 1;
+      g_ble.connect(index);
+    }, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<std::uintptr_t>(device.index + 1)));
+    lv_obj_t* name = lv_label_create(row);
+    const std::string title = device.name.empty() ? "Unknown BLE device" : device.name;
+    lv_label_set_text(name, title.c_str());
+    lv_obj_set_width(name, lv_pct(75));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(reconclave::ui::kColorForeground), 0);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_t* detail = lv_label_create(row);
+    const std::string summary = device.address + "  //  " + std::to_string(device.rssi_dbm) +
+        " dBm" + (device.uart_service ? "  //  BLE UART" : "");
+    lv_label_set_text(detail, summary.c_str());
+    lv_obj_set_style_text_font(detail, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(detail, lv_color_hex(reconclave::ui::kColorSecondary), 0);
+    lv_obj_align(detail, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  }
+  if (g_ble.devices().empty()) {
+    lv_obj_t* empty = lv_label_create(g_ble_list);
+    lv_label_set_text(empty, g_ble.scanning() ? "Searching..." : "Tap Scan to find nearby BLE devices.");
+    lv_obj_set_style_text_color(empty, lv_color_hex(reconclave::ui::kColorSecondary), 0);
   }
 }
 
@@ -1589,6 +1668,10 @@ void refreshLiveDetails(lv_timer_t*) {
       setGnssRunning(true);
     } else if (ui_command == "gnss stop") {
       setGnssRunning(false);
+    } else if (ui_command == "ble scan") {
+      g_ble.scan();
+    } else if (ui_command == "ble disconnect") {
+      g_ble.disconnect();
     } else if (ui_command.rfind(kPrefix, 0) == 0) {
       const std::string requested = ui_command.substr(sizeof(kPrefix) - 1);
       const auto target = std::find_if(g_ui_screens.begin(), g_ui_screens.end(),
@@ -1598,6 +1681,7 @@ void refreshLiveDetails(lv_timer_t*) {
   }
   g_gnss.poll();
   writeGnssRuntimeStatus();
+  writeBleRuntimeStatus();
   refreshBatteryState();
   writeBatteryRuntimeStatus();
   refreshStatusBars(nullptr);
@@ -2446,6 +2530,62 @@ lv_obj_t* buildPhotoViewerScreen(lv_obj_t* home) {
   return screen;
 }
 
+lv_obj_t* buildBluetoothScreen(lv_obj_t* home) {
+  using namespace reconclave::ui;
+  lv_obj_t* screen = createScreen();
+  addStatusBar(screen, "BLUETOOTH", true);
+  addBackButton(screen, home);
+
+  g_ble_scan_button = lv_button_create(screen);
+  lv_obj_set_size(g_ble_scan_button, 130, kBackButtonHeight);
+  lv_obj_align(g_ble_scan_button, LV_ALIGN_TOP_RIGHT, -kSafeMargin,
+               kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(g_ble_scan_button, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(g_ble_scan_button, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(g_ble_scan_button, 1, 0);
+  lv_obj_set_style_radius(g_ble_scan_button, 8, 0);
+  lv_obj_add_event_cb(g_ble_scan_button, [](lv_event_t*) { g_ble.scan(); },
+                      LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* scan_label = lv_label_create(g_ble_scan_button);
+  lv_label_set_text(scan_label, LV_SYMBOL_REFRESH " Scan BLE");
+  lv_obj_set_style_text_color(scan_label, lv_color_hex(kColorAccent), 0);
+  lv_obj_center(scan_label);
+
+  g_ble_disconnect_button = lv_button_create(screen);
+  lv_obj_set_size(g_ble_disconnect_button, 150, kBackButtonHeight);
+  lv_obj_align(g_ble_disconnect_button, LV_ALIGN_TOP_RIGHT, -kSafeMargin - 142,
+               kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(g_ble_disconnect_button, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(g_ble_disconnect_button, lv_color_hex(kColorAmber), 0);
+  lv_obj_set_style_border_width(g_ble_disconnect_button, 1, 0);
+  lv_obj_set_style_radius(g_ble_disconnect_button, 8, 0);
+  lv_obj_add_event_cb(g_ble_disconnect_button, [](lv_event_t*) { g_ble.disconnect(); },
+                      LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* disconnect_label = lv_label_create(g_ble_disconnect_button);
+  lv_label_set_text(disconnect_label, LV_SYMBOL_CLOSE " Disconnect");
+  lv_obj_set_style_text_color(disconnect_label, lv_color_hex(kColorAmber), 0);
+  lv_obj_center(disconnect_label);
+
+  g_ble_status = lv_label_create(screen);
+  lv_obj_set_width(g_ble_status, contentWidth(screen));
+  lv_obj_set_height(g_ble_status, 40);
+  lv_label_set_long_mode(g_ble_status, LV_LABEL_LONG_MODE_DOTS);
+  lv_label_set_text(g_ble_status, "Checking nRF52840 BLE radio...");
+  lv_obj_set_style_text_font(g_ble_status, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(g_ble_status, lv_color_hex(kColorAccent), 0);
+  lv_obj_align(g_ble_status, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
+
+  g_ble_list = lv_obj_create(screen);
+  lv_obj_set_size(g_ble_list, contentWidth(screen), contentHeight(screen) - 46);
+  lv_obj_align(g_ble_list, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + 46);
+  lv_obj_set_style_bg_opa(g_ble_list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(g_ble_list, 0, 0);
+  lv_obj_set_style_pad_all(g_ble_list, 0, 0);
+  lv_obj_set_style_pad_row(g_ble_list, 8, 0);
+  lv_obj_set_flex_flow(g_ble_list, LV_FLEX_FLOW_COLUMN);
+  return screen;
+}
+
 lv_obj_t* buildLocationScreen(lv_obj_t* home) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
@@ -3210,7 +3350,7 @@ lv_obj_t* buildWifiPasswordScreen(lv_obj_t* home) {
 
 lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t* wifi_setup_screen,
                               lv_obj_t* devices_screen, lv_obj_t* node_screen,
-                              lv_obj_t* location_screen) {
+                              lv_obj_t* location_screen, lv_obj_t* bluetooth_screen) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
   addStatusBar(screen, "SETTINGS", true);
@@ -3236,16 +3376,8 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
   // Settings section for why those two are deliberately not the same
   // screen.
   addSettingsRow(list, LV_SYMBOL_WIFI, "Wi-Fi", "Connect to a wireless network", wifi_setup_screen);
-  lv_obj_t* bluetooth_row = addSettingsRow(list, LV_SYMBOL_BLUETOOTH, "Bluetooth",
-                                           "Radio unavailable in this hardware build", nullptr);
-  lv_obj_t* bluetooth_status = lv_label_create(bluetooth_row);
-  lv_label_set_text(bluetooth_status, "UNAVAILABLE");
-  lv_obj_set_width(bluetooth_status, lv_pct(42));
-  lv_label_set_long_mode(bluetooth_status, LV_LABEL_LONG_MODE_DOTS);
-  lv_obj_set_style_text_align(bluetooth_status, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_style_text_font(bluetooth_status, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(bluetooth_status, lv_color_hex(kColorSecondary), 0);
-  lv_obj_align(bluetooth_status, LV_ALIGN_RIGHT_MID, 0, 0);
+  addSettingsRow(list, LV_SYMBOL_BLUETOOTH, "Bluetooth",
+                 "Scan and connect with nRF52840 BLE", bluetooth_screen);
   addSettingsRow(list, LV_SYMBOL_GPS, "Location", "GNSS receiver and evidence geotagging",
                  location_screen);
 
@@ -3773,6 +3905,7 @@ int main() {
   lv_obj_t* vision_screen = buildVisionScreen(home);
   buildPhotoViewerScreen(home);  // sets g_photo_viewer_screen; opened only from VISION's preview.
   lv_obj_t* location_screen = buildLocationScreen(home);
+  lv_obj_t* bluetooth_screen = buildBluetoothScreen(home);
   lv_obj_t* assessment_screen = buildAssessmentScreen(home);
   lv_obj_t* node_screen = buildNodeScreen(home);
   lv_obj_t* evidence_screen = buildEvidenceScreen(home);
@@ -3780,7 +3913,8 @@ int main() {
   buildWifiPasswordScreen(home);  // sets g_wifi_password_screen; opened only from Wi-Fi setup's list.
   lv_obj_t* wifi_setup_screen = buildWifiSetupScreen(home);
   lv_obj_t* settings_screen = buildSettingsScreen(home, network_screen, wifi_setup_screen,
-                                                  devices_screen, node_screen, location_screen);
+                                                  devices_screen, node_screen, location_screen,
+                                                  bluetooth_screen);
   lv_obj_t* capture_screen = buildCaptureScreen(home);
   lv_obj_t* nmap_screen = buildNmapScreen(home);
   lv_obj_t* tools_screen = buildToolsScreen(home, recon_screen, nmap_screen, wireless_screen,
@@ -3792,7 +3926,7 @@ int main() {
       {"recon", recon_screen}, {"findings", g_findings_screen}, {"nmap", nmap_screen},
       {"packet", capture_screen}, {"evidence", evidence_screen}, {"vision", vision_screen},
       {"location", location_screen}, {"session", assessment_screen}, {"node", node_screen},
-      {"device", devices_screen}, {"settings", settings_screen},
+      {"device", devices_screen}, {"settings", settings_screen}, {"bluetooth", bluetooth_screen},
   };
 
   // Home is deliberately asymmetric: a persistent mission strip gives
@@ -3890,6 +4024,9 @@ int main() {
   for (auto* utility : utilities) lv_obj_set_size(utility, (918 - 20 - 32) / 5, 58);
 
   refreshLiveDetails(nullptr);
+  g_ble.open();
+  refreshBluetoothDetails(nullptr);
+  lv_timer_create(refreshBluetoothDetails, 100, nullptr);
   lv_timer_create(refreshLiveDetails, 3000, nullptr);
   lv_timer_create(pollHardwareKeyboard, 25, nullptr);
   lv_screen_load(home);

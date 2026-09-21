@@ -129,6 +129,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
     src/network_inventory.cpp
     src/gnss_nmea.cpp
     src/gnss_receiver.cpp
+    src/ble_bridge.cpp
     src/json.cpp
     src/trust_crypto.cpp
     src/evidence_store.cpp

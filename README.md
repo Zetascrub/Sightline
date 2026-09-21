@@ -322,32 +322,16 @@ on the device's existing rootfs.
 7. **Perception.** Camera capture, OCR, object detection via the vendor KPU
    runtime. `/dev/video0`-`video4` plus dedicated ISP/VPU device nodes
    confirmed present.
-8. **BLE — still broken, narrowed down further but not resolved.**
-   `aic_btusb` loads (confirmed via dmesg: registers as a USB interface
-   driver, version 2.1.0), but the AIC8800's Bluetooth-over-USB endpoint
-   never appears anywhere on `/sys/bus/usb/devices` - not as an operational
-   device, and not even at the intermediate "boot ROM" USB PID
-   (`a69c:8d80`) that public documentation for this same chip family
-   describes `aic_load_fw` uploading combined WiFi+BT firmware to before
-   the chip re-enumerates as its final PID. That upload never happens here
-   at all: `aic_load_fw` is loaded but its only holder is `aic8800_fdrv`
-   (confirmed via `/sys/module/aic_load_fw/holders/`), which is this
-   board's WiFi driver, talking over SDIO, not USB - `aic_btusb` never
-   triggers any firmware load of its own, it just waits passively for a
-   USB device that never shows up. One of the two DWC OTG USB controllers
-   (`91500000.usb`, bus 1) has zero devices attached at all, not even the
-   boot-ROM stage - both controllers log "supply vusb_d/vusb_a not found,
-   using dummy regulator" at boot, meaning no real VBUS regulator/enable
-   GPIO is wired up in the devicetree for either bus, so if AIC8800 BT
-   needs one, nothing in this image's boot sequence would toggle it. This
-   matches the general shape of GNSS's real root cause (an unwired enable
-   step, not a firmware/driver defect) closely enough to be a real lead,
-   but unlike GNSS's documented `GPIO2`, there's no equivalent pointer
-   anywhere found for BT - probing GPIO lines by trial and error without
-   schematics wasn't judged worth the risk. Needs either vendor
-   engineering docs or a serial console capturing the AIC8800's own boot
-   messages (same underlying gap as the boot-splash work above) to make
-   further progress without guessing.
+8. **BLE — working through the onboard nRF52840.** The initial investigation
+   followed the loaded `aic_btusb` driver and found no matching USB device or
+   `hci0`. LILYGO's K230 nRF52840 AT guide documents the actual BLE route on
+   this hardware: `/dev/ttyS1` at 115200 baud. On this unit, `AT+VER?`
+   returned `K230_NRF52840_AT,2026-08-16-k230-uart-dfu-r3`, `AT+STATUS?`
+   reported `READY`, and `AT+SCAN=5` found nearby BLE peripherals. The
+   Bluetooth Settings row now opens a BLE screen backed by this UART link;
+   it scans, lists devices, and allows a user to connect or disconnect.
+   The AIC USB endpoint remains absent, so BlueZ still has no `hci0` and
+   Linux applications expecting an HCI adapter cannot use that path.
 9. **Trust bootstrap - device side done, fleet-tool side still open.** A
    64-character hex execution key generated on-device from `/dev/urandom`
    and written to `/root/reconclave/trust/execution.key` (the path
@@ -612,17 +596,10 @@ Findings:
   devices on this board (USB/SDIO enumeration and GPIO-bit-banged I2C
   respectively, as already documented elsewhere in this file) - matches
   what's implemented.
-- **BT specifically**: `aic_btusb` loads, firmware blobs are present and
-  identical to stock, but the chip's Bluetooth-over-USB endpoint never
-  appears on `/sys/bus/usb/devices` at all (only the RTL8152 Ethernet
-  bridge and root hubs do) - `hci0` never gets created because nothing
-  ever binds to it, not because of a firmware/config difference. Wi-Fi
-  works fine on the same chip via a *different* bus (SDIO,
-  `/sys/bus/sdio/devices/mmc0:0001:1`, `wlan0` present and scannable).
-  Given every relevant file is identical to stock, this looks like a
-  hardware/power-sequencing quirk present in the original firmware too,
-  not a regression from the custom rebuild - not independently confirmed
-  by booting genuine stock firmware on this same unit, though.
+- **BT driver investigation (historical)**: `aic_btusb` loads but its USB
+  endpoint is absent, so BlueZ has no `hci0`. Wi-Fi uses the AIC chip over
+  SDIO. This observation remains true, but the K230's working BLE path is
+  the separate nRF52840 UART bridge described in milestone 8 above.
 - The vendor's own software references an **nRF9151** modem
   (`[nrf9151] IO2 iomux ...` in `k230_phone_ui`'s own startup log, see
   below) - `src/gnss_receiver.cpp`'s Nordic-style AT command set wasn't
@@ -974,7 +951,7 @@ against real K230 hardware rather than assumed:
 | Hash-chained evidence timeline | Implemented; field validation pending | Authenticated tool results and host changes carry assessment context in an append-only timeline whose integrity and record count are shown in the UI |
 | Evidence manifest | Implemented; field validation pending | UI and authenticated API can verify the timeline and publish a bounded SHA-256 inventory bound to node, firmware, project, engagement and operator identity; symlinks are excluded |
 | Evidence CSV export | Done | Not a removable microSD like Cardputer - see milestone 6 |
-| BLE discovery | Blocked | Driver issue, see milestone 8 above |
+| BLE discovery | Done locally | nRF52840 UART BLE scan is proven on hardware and available from the Bluetooth screen; no BlueZ HCI adapter is present |
 | Touchscreen UI | Done | Milestone 6 - §18 mockup, landscape, touch navigation |
 | Keyboard-driven navigation | Done | See "Keyboard-driven navigation" below - this row was stale, milestone 4/6 had already wired most of it |
 | GNSS / cellular | Modem enable + legacy GPS API confirmed on real hardware; live sky fix still needs on-site testing | See "GNSS: the modem was just never powered on" below. Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, drives the modem's enable GPIO, starts the legacy `#XGPS` sequence (this firmware doesn't support the modern `#XGNSS` API), validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. Cellular assessment tools remain |
