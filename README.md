@@ -871,8 +871,8 @@ recovery. The LOCATION screen now distinguishes **GNSS OFF**, **START FAILED**,
 modem/API diagnostics. The same UI start path can be exercised through the
 root-only `/run/reconclave/ui-command` file (`gnss start` / `gnss stop`). On the
 device, the deployed UI reported `RUNNING yes` and `Legacy GPS active; waiting
-for position report` after `gnss start`. An outdoor position fix remains to be
-verified.
+for position report` after `gnss start`. The subsequent open-sky fix is
+documented below.
 
 During a later window test, the live modem still reported `#XGPS: 1,1`
 (legacy GPS active) but no position notification. This firmware rejects
@@ -880,8 +880,8 @@ During a later window test, the live modem still reported `#XGPS: 1,1`
 do **not** prove that no satellites are visible; the modem provides no
 intermediate satellite telemetry through this UART path. The LOCATION screen
 now says the satellite count is unavailable when NMEA is disabled, and the
-runtime status includes `NMEA_ENABLED`. A clear open-sky test is needed to
-separate window signal loss from an RF/antenna problem.
+runtime status includes `NMEA_ENABLED`. The later open-sky test below confirms
+the receiver and position parser work.
 
 Outdoor follow-up (2026-09-21): with the device under open sky, the live UI
 continued to report `RUNNING yes`, `Legacy GPS active; waiting for position
@@ -898,6 +898,20 @@ still need physical verification. The installed legacy SLM firmware rejects
 `AT#XNMEA=1`, leaving no satellite signal telemetry for a software-only RF
 diagnosis. LilyGO's newer K230 nRF9151 firmware source adds GNSS NMEA URCs,
 but flashing that firmware requires a separate, verified update path.
+
+Confirmed fix (2026-09-21): opening the keyboard assembly showed a separate
+coax lead connected to `GNSS-ANT1`, terminating in a small ceramic patch
+antenna. `GNSS-ANT2` was unused. This rules out the earlier shared-antenna
+theory; `%XANTCFG` was not changed. With the patch's white ceramic face flat
+and pointing at unobstructed sky, the existing UI `gnss start` path produced
+`#XGPS: 1,4` after approximately four minutes. `/run/reconclave/gnss-status`
+then reported `RUNNING yes`, `FIX yes`, `STATUS GNSS fix acquired`, and valid
+latitude, longitude, and altitude. This confirms the modem RF path, the
+legacy `#XGPS` setup, the asynchronous position parser, and the UI state.
+The earlier no-fix result is consistent with patch orientation or placement;
+the test does not isolate which earlier physical factor blocked reception.
+Satellite count remains unavailable on the installed firmware because NMEA
+output is rejected.
 
 `src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
 coordinate helpers were split out of `gnss_receiver.cpp` into their own
@@ -970,7 +984,7 @@ against real K230 hardware rather than assumed:
 | BLE discovery | Done locally | nRF52840 UART BLE scan is proven on hardware and available from the Bluetooth screen; no BlueZ HCI adapter is present |
 | Touchscreen UI | Done | Milestone 6 - §18 mockup, landscape, touch navigation |
 | Keyboard-driven navigation | Done | See "Keyboard-driven navigation" below - this row was stale, milestone 4/6 had already wired most of it |
-| GNSS / cellular | Modem enable + legacy GPS API confirmed on real hardware; live sky fix still needs on-site testing | See "GNSS: the modem was just never powered on" below. Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, drives the modem's enable GPIO, starts the legacy `#XGPS` sequence (this firmware doesn't support the modern `#XGNSS` API), validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. Cellular assessment tools remain |
+| GNSS / cellular | GNSS fix confirmed outdoors; cellular assessment remains | See "GNSS: the modem was just never powered on" below. Non-blocking nRF9151 receiver uses `/dev/ttyS3` at 115200 baud, drives the modem's enable GPIO, starts the legacy `#XGPS` sequence (this firmware doesn't support the modern `#XGNSS` API), validates NMEA checksums, parses GGA/RMC and geotags Wi-Fi evidence. The ceramic GNSS patch must face open sky. Satellite count is unavailable with the installed firmware. |
 | Assessment sessions | Done | Persistent project, engagement and operator context is editable on-device and embedded into exported observations |
 | Node/job dashboard | Done | Local UI shows trust state, node address, capability count and live remote discovery progress/findings through an atomic runtime-status channel |
 | CC1101 sub-GHz, NFC | **Not applicable** | Cardputer-specific accessory hardware; no direct K230 equivalent |
