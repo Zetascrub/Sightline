@@ -299,10 +299,24 @@ on the device's existing rootfs.
 8. **BLE — currently broken on this image.** `aic_btusb` driver loads but
    registers zero HCI controllers (`bluetoothd`: "Number of controllers:
    0"). Needs further driver-level investigation before it's portable.
-9. **Trust bootstrap.** Add a `--k230-id` to `tools/provision_fleet.py` and
-   wire in fleet trust keys before enabling any non-benign capability -
-   required before `radio.wifi.scan` (or anything else non-benign) can move
-   from advertised-only to actually dispatchable.
+9. **Trust bootstrap - device side done, fleet-tool side still open.** A
+   64-character hex execution key generated on-device from `/dev/urandom`
+   and written to `/root/reconclave/trust/execution.key` (the path
+   `main.cpp` already reads by default) is enough on its own: restarting
+   `reconclave-k230-node` picked it up, `security.mode` in
+   `GET /reconclave/v1/announce` moved from `"unprovisioned"` to
+   `"hmac-sha256-128"`, and every previously advertised-only capability
+   (`radio.wifi.scan`, `net.discovery.scan`, `assessment.findings.snapshot`,
+   ...) now reports `permission: "trusted"` instead of being absent from
+   dispatch. Confirmed this isn't just cosmetic: a `radio.wifi.scan` request
+   with no `auth` block still gets `rejected`/`UNAUTHENTICATED` - the device
+   enforces its own signature check regardless of what generated the key.
+   What's still missing is the other half of the pairing: nothing outside
+   this device knows this key yet, so nothing can actually construct a
+   valid signed request against it. That's `tools/provision_fleet.py`
+   (lives in the sibling `Reconclave` repo, not here) - adding K230 support
+   there so a coordinator is issued/registers the same key remains
+   unstarted follow-up work.
 
 ## Boot splash — paused, unresolved, needs serial console to continue
 
