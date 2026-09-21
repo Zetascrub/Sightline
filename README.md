@@ -883,6 +883,22 @@ now says the satellite count is unavailable when NMEA is disabled, and the
 runtime status includes `NMEA_ENABLED`. A clear open-sky test is needed to
 separate window signal loss from an RF/antenna problem.
 
+Outdoor follow-up (2026-09-21): with the device under open sky, the live UI
+continued to report `RUNNING yes`, `Legacy GPS active; waiting for position
+report`, and no fix. A read-only UART diagnostic briefly paused the UI reader
+without resetting the modem or stopping acquisition. The modem replied
+`#XGPS: 1,1` to `AT#XGPS?`, `+CFUN: 1` to `AT+CFUN?`,
+`%XSYSTEMMODE: 0,0,1,0` to `AT%XSYSTEMMODE?`, an empty mapping to
+`AT%XMAGPIO?`, and `%XCOEX0: 1,1,1565,1586` to `AT%XCOEX0?`.
+Nordic documents `#XGPS=1,0,0,0` as a single fix with an indefinite timeout,
+so this is not a 60-second timeout or a stopped receiver. The COEX0 setting
+matches Nordic's common GNSS LNA frequency window, but the keyboard extension
+board RF schematic has not been found, so its antenna wiring and connector
+still need physical verification. The installed legacy SLM firmware rejects
+`AT#XNMEA=1`, leaving no satellite signal telemetry for a software-only RF
+diagnosis. LilyGO's newer K230 nRF9151 firmware source adds GNSS NMEA URCs,
+but flashing that firmware requires a separate, verified update path.
+
 `src/gnss_nmea.{h,cpp}` (new): `parseNmeaSentence()` and its checksum/
 coordinate helpers were split out of `gnss_receiver.cpp` into their own
 files with no libgpiod dependency. This wasn't a style preference - once
