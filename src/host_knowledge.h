@@ -7,6 +7,7 @@
 
 #include "discovery_job.h"
 #include "json.h"
+#include "nmap_import.h"
 #include "network_inventory.h"
 #include "network_tools.h"
 
@@ -18,6 +19,9 @@ struct KnownService {
   std::string banner;
   std::string attention;
   std::uint64_t last_seen_ms = 0;
+  std::string protocol = "tcp";
+  std::string source = "";
+  std::string method = "";
 };
 
 struct HostRecord {
@@ -30,6 +34,11 @@ struct HostRecord {
   std::uint64_t last_seen_ms = 0;
   std::uint64_t observations = 0;
   std::uint64_t changes = 0;
+  std::string hostname = "";
+  std::string scan_source = "", scan_completion = "", scan_coverage = "";
+  std::uint64_t scan_observed_ms = 0;
+  std::string passive_source;
+  std::uint64_t passive_observed_ms = 0;
 };
 
 class HostKnowledge {
@@ -41,6 +50,9 @@ class HostKnowledge {
   unsigned observeArp(const std::vector<ArpNeighbour>& neighbours, std::uint64_t now_ms);
   unsigned observeDiscovery(const std::vector<DiscoveredHost>& hosts, std::uint64_t now_ms);
   unsigned observeService(const ServiceObservation& service, std::uint64_t now_ms);
+  unsigned observeNmap(const NmapResult& result);
+  unsigned observePassive(const std::vector<ArpNeighbour>& hosts, std::uint64_t now_ms,
+                          const std::string& source);
   std::vector<HostRecord> snapshot() const;
   json::Value toJson() const;
   json::Value findingsJson() const;

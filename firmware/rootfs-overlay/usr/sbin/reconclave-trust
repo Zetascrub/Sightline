@@ -5,7 +5,11 @@ KEY_DIR=/root/reconclave/trust
 KEY_FILE=$KEY_DIR/execution.key
 
 status() {
-	if [ -f "$KEY_FILE" ] && [ "$(wc -c < "$KEY_FILE")" -eq 65 ]; then
+	# The loader accepts 64 hex characters with or without a final newline.
+	# Keys copied from other provisioners may have no newline.
+	if [ -f "$KEY_FILE" ] &&
+		[ "$(tr -d '\n' < "$KEY_FILE" | wc -c)" -eq 64 ] &&
+		[ "$(tr -d '0-9a-fA-F\n' < "$KEY_FILE" | wc -c)" -eq 0 ]; then
 		echo "Execution trust: provisioned"
 	else
 		echo "Execution trust: unprovisioned"

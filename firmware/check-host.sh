@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-required=(git make gcc g++ rsync python3 wget tar xz m4 patch sed awk magick)
+required=(git make gcc g++ rsync python3 wget tar xz m4 patch sed awk)
 missing=()
 for command_name in "${required[@]}"; do
 	command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")

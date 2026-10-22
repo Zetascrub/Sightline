@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -9,6 +10,13 @@
 #include <utility>
 
 namespace reconclave {
+namespace {
+std::string normalMac(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+}
+
 
 HostKnowledge::HostKnowledge(std::string path) : path_(std::move(path)) {}
 
@@ -21,7 +29,7 @@ HostRecord& HostKnowledge::touch(const std::string& address, std::uint64_t now_m
     host.address = address;
     host.first_seen_ms = now_ms;
   }
-  host.last_seen_ms = now_ms;
+  host.last_seen_ms = std::max(host.last_seen_ms, now_ms);
   ++host.observations;
   return host;
 }
@@ -33,9 +41,10 @@ unsigned HostKnowledge::observeArp(const std::vector<ArpNeighbour>& neighbours,
     if (!neighbour.complete || neighbour.address.empty()) continue;
     HostRecord& host = touch(neighbour.address, now_ms);
     bool changed = false;
-    if (!neighbour.mac.empty() && host.mac != neighbour.mac) {
+    const auto mac = normalMac(neighbour.mac);
+    if (!mac.empty() && normalMac(host.mac) != mac) {
       changed = !host.mac.empty();
-      host.mac = neighbour.mac;
+      host.mac = mac;
     }
     if (!neighbour.interface.empty() && host.interface != neighbour.interface) {
       changed = changed || !host.interface.empty();
@@ -72,7 +81,7 @@ unsigned HostKnowledge::observeService(const ServiceObservation& observation,
   if (!observation.connected || observation.address.empty() || observation.port == 0) return 0;
   HostRecord& host = touch(observation.address, now_ms);
   auto existing = std::find_if(host.services.begin(), host.services.end(), [&](const KnownService& service) {
-    return service.port == observation.port;
+    return service.port == observation.port && service.protocol == "tcp";
   });
   if (existing == host.services.end()) {
     host.services.push_back({observation.port, observation.service, observation.banner,
@@ -86,8 +95,70 @@ unsigned HostKnowledge::observeService(const ServiceObservation& observation,
   existing->banner = observation.banner;
   existing->attention = observation.attention;
   existing->last_seen_ms = now_ms;
+  existing->source.clear(); existing->method.clear();
   if (changed) ++host.changes;
   return changed ? 1 : 0;
+}
+
+unsigned HostKnowledge::observeNmap(const NmapResult& result) {
+  unsigned imported = 0;
+  for (const auto& observation : result.hosts) {
+    auto& host = hosts_[observation.address];
+    if (host.scan_source == result.source && host.scan_observed_ms == result.observed_ms) continue;
+    host.address = observation.address;
+    if (!host.first_seen_ms || result.observed_ms < host.first_seen_ms) host.first_seen_ms = result.observed_ms;
+    host.last_seen_ms = std::max(host.last_seen_ms, result.observed_ms);
+    ++host.observations; ++imported;
+    if (result.observed_ms >= host.scan_observed_ms) {
+      if (!observation.mac.empty()) host.mac = normalMac(observation.mac);
+      if (!observation.hostname.empty()) host.hostname = observation.hostname;
+      host.scan_source = result.source; host.scan_completion = result.completion;
+      host.scan_coverage = result.coverage; host.scan_observed_ms = result.observed_ms;
+    }
+    for (const auto& port : observation.ports) {
+      if (port.state != "open") continue;
+      if (port.protocol == "tcp" && std::find(host.open_ports.begin(), host.open_ports.end(), port.port) == host.open_ports.end())
+        host.open_ports.push_back(port.port);
+      auto it = std::find_if(host.services.begin(), host.services.end(), [&](const auto& service) {
+        return service.port == port.port && service.protocol == port.protocol;
+      });
+      if (it != host.services.end() && it->last_seen_ms > result.observed_ms) continue;
+      if (it != host.services.end() && port.method != "probed" && !it->banner.empty()) continue;
+      KnownService service;
+      service.port = port.port; service.protocol = port.protocol;
+      service.service = port.service.empty() ? "unknown" : port.service;
+      service.banner = port.product + (port.version.empty() ? "" : " " + port.version);
+      service.source = result.source; service.method = port.method;
+      service.last_seen_ms = result.observed_ms;
+      // An open port/version guess is not automatically a security finding.
+      if (it == host.services.end()) host.services.push_back(std::move(service));
+      else {
+        service.attention = it->attention;
+        *it = std::move(service);
+      }
+    }
+    std::sort(host.open_ports.begin(), host.open_ports.end());
+  }
+  return imported;
+}
+
+unsigned HostKnowledge::observePassive(const std::vector<ArpNeighbour>& observations,
+                                       std::uint64_t now_ms, const std::string& source) {
+  unsigned count = 0;
+  for (const auto& observation : observations) {
+    if (!observation.complete || observation.address.empty()) continue;
+    auto& host = touch(observation.address, now_ms);
+    // A passive MAC/IP claim is useful evidence, not enough to overwrite a
+    // conflicting identity or create an asset-change finding by itself.
+    if (host.mac.empty()) host.mac = normalMac(observation.mac);
+    if (host.interface.empty()) host.interface = observation.interface;
+    if (now_ms >= host.passive_observed_ms) {
+      host.passive_source = source;
+      host.passive_observed_ms = now_ms;
+    }
+    ++count;
+  }
+  return count;
 }
 
 std::vector<HostRecord> HostKnowledge::snapshot() const {
@@ -101,6 +172,9 @@ std::vector<HostRecord> HostKnowledge::snapshot() const {
 
 json::Value HostKnowledge::toJson() const {
   json::Value result = json::Value::makeObject();
+  result.set("schema", json::Value::makeString("sightline-assets/v1"));
+  result.set("scope", json::Value::makeString("device-history"));
+  result.set("coverage", json::Value::makeString("partial-observations"));
   json::Value entries = json::Value::makeArray();
   std::size_t attention_count = 0;
   for (const auto& map_entry : hosts_) {
@@ -109,6 +183,13 @@ json::Value HostKnowledge::toJson() const {
     entry.set("address", json::Value::makeString(host.address));
     entry.set("mac", json::Value::makeString(host.mac));
     entry.set("interface", json::Value::makeString(host.interface));
+    entry.set("hostname", json::Value::makeString(host.hostname));
+    entry.set("scan_source", json::Value::makeString(host.scan_source));
+    entry.set("scan_completion", json::Value::makeString(host.scan_completion));
+    entry.set("scan_coverage", json::Value::makeString(host.scan_coverage));
+    entry.set("scan_observed_ms", json::Value::makeNumber(static_cast<double>(host.scan_observed_ms)));
+    entry.set("passive_source", json::Value::makeString(host.passive_source));
+    entry.set("passive_observed_ms", json::Value::makeNumber(static_cast<double>(host.passive_observed_ms)));
     json::Value ports = json::Value::makeArray();
     for (const auto port : host.open_ports) ports.push_back(json::Value::makeNumber(port));
     entry.set("open_ports", ports);
@@ -117,6 +198,11 @@ json::Value HostKnowledge::toJson() const {
       json::Value item = json::Value::makeObject();
       item.set("port", json::Value::makeNumber(service.port));
       item.set("service", json::Value::makeString(service.service));
+      item.set("transport", json::Value::makeString(service.protocol));
+      item.set("source", json::Value::makeString(service.source));
+      item.set("method", json::Value::makeString(service.method));
+      item.set("label_basis", json::Value::makeString((service.method == "table" || (service.method.empty() && service.banner.empty())) ? "port-inference" : "response-classification"));
+      item.set("validation", json::Value::makeString("not-validated"));
       item.set("banner", json::Value::makeString(service.banner));
       item.set("attention", json::Value::makeString(service.attention));
       item.set("last_seen_ms", json::Value::makeNumber(static_cast<double>(service.last_seen_ms)));
@@ -241,8 +327,15 @@ bool HostKnowledge::load(std::string& error) {
       return false;
     }
     host.address = address->asString();
-    if (const auto* value = entry.find("mac")) host.mac = value->asString();
+    if (const auto* value = entry.find("mac")) host.mac = normalMac(value->asString());
     if (const auto* value = entry.find("interface")) host.interface = value->asString();
+    if (const auto* value = entry.find("hostname")) host.hostname = value->asString();
+    if (const auto* value = entry.find("scan_source")) host.scan_source = value->asString();
+    if (const auto* value = entry.find("scan_completion")) host.scan_completion = value->asString();
+    if (const auto* value = entry.find("scan_coverage")) host.scan_coverage = value->asString();
+    if (const auto* value = entry.find("scan_observed_ms")) host.scan_observed_ms = value->asUInt64();
+    if (const auto* value = entry.find("passive_source")) host.passive_source = value->asString();
+    if (const auto* value = entry.find("passive_observed_ms")) host.passive_observed_ms = value->asUInt64();
     if (const auto* value = entry.find("first_seen_ms")) host.first_seen_ms = value->asUInt64();
     if (const auto* value = entry.find("last_seen_ms")) host.last_seen_ms = value->asUInt64();
     if (const auto* value = entry.find("observations")) host.observations = value->asUInt64();
@@ -268,6 +361,10 @@ bool HostKnowledge::load(std::string& error) {
         if (const auto* value = item.find("banner")) service.banner = value->asString();
         if (const auto* value = item.find("attention")) service.attention = value->asString();
         if (const auto* value = item.find("last_seen_ms")) service.last_seen_ms = value->asUInt64();
+        if (const auto* value = item.find("transport")) service.protocol = value->asString();
+        if (service.protocol != "tcp" && service.protocol != "udp") continue;
+        if (const auto* value = item.find("source")) service.source = value->asString();
+        if (const auto* value = item.find("method")) service.method = value->asString();
         host.services.push_back(std::move(service));
       }
     }

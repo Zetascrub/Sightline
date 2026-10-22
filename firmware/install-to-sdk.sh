@@ -35,9 +35,14 @@ fi
 mkdir -p "$PACKAGE_DIR/src"
 install -m 0644 "$SCRIPT_DIR/Config.in" "$PACKAGE_DIR/Config.in"
 install -m 0644 "$SCRIPT_DIR/reconclave-k230.mk" "$PACKAGE_DIR/reconclave-k230.mk"
+# Buildroot's stock Nmap package disables bundled Lua, which removes NSE.
+# Overlay the pinned package recipe so Nmap installs its native script engine.
+install -D -m 0644 "$SCRIPT_DIR/buildroot/package/nmap/nmap.mk" \
+	"$SDK_DIR/buildroot-overlay/package/nmap/nmap.mk"
 rsync -a --delete \
 	--exclude '.git' --exclude '.toolchains' --exclude 'build*' \
-	--exclude '.venv*' --exclude '.cache' \
+	--exclude '.venv*' --exclude '.cache' --exclude '.backups' \
+	--exclude 'assessments' --exclude 'research_notes' --exclude 'reports' \
 	"$PROJECT_DIR/" "$PACKAGE_DIR/src/"
 rsync -a --exclude 'root/.ssh/' "$SCRIPT_DIR/rootfs-overlay/" "$ROOTFS_DIR/"
 chmod 0755 "$ROOTFS_DIR/etc/init.d/S90reconclave-node" \
@@ -49,6 +54,10 @@ chmod 0755 "$ROOTFS_DIR/etc/init.d/S90reconclave-node" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-capture" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-screenshot" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-nmap" \
+	"$ROOTFS_DIR/usr/sbin/reconclave-enumerate" \
+	"$ROOTFS_DIR/usr/sbin/reconclave-mission" \
+	"$ROOTFS_DIR/usr/sbin/reconclave-passive" \
+	"$ROOTFS_DIR/usr/sbin/reconclave-capabilities" \
 	"$ROOTFS_DIR/usr/sbin/reconclave-trust"
 # Root SSH key material is per-deployment and gitignored (public-source policy,
 # tools/check_public_tree.py), so it is not carried by the rsync above. Assemble
@@ -92,6 +101,13 @@ for option in \
 	BR2_PACKAGE_NMAP \
 	BR2_PACKAGE_OPENSSL \
 	BR2_PACKAGE_LIBOPENSSL_BIN \
+	BR2_PACKAGE_LIBCURL \
+	BR2_PACKAGE_LIBCURL_CURL \
+	BR2_PACKAGE_LIBCURL_OPENSSL \
+	BR2_PACKAGE_BIND \
+	BR2_PACKAGE_BIND_TOOLS \
+	BR2_PACKAGE_JEMALLOC \
+	BR2_PACKAGE_JQ \
 	BR2_PACKAGE_SOCAT \
 	BR2_PACKAGE_ETHTOOL
 do

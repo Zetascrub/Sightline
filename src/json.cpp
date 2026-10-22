@@ -185,6 +185,17 @@ class Parser {
  public:
   explicit Parser(const std::string& text) : text_(text) {}
 
+  // Parses one value and requires that nothing but whitespace follows. The
+  // hash-chain verifier re-hashes the parsed object, so trailing bytes after
+  // a record's closing brace would otherwise be dropped silently and pass
+  // the tamper check (verifyContents in evidence_store.cpp).
+  bool parseDocument(Value& out) {
+    if (!parseValue(out)) return false;
+    skipWhitespace();
+    if (pos_ != text_.size()) return fail("trailing data after value");
+    return true;
+  }
+
   bool parseValue(Value& out) {
     skipWhitespace();
     if (pos_ >= text_.size()) return fail("unexpected end of input");
@@ -384,7 +395,7 @@ class Parser {
 
 bool parse(const std::string& text, Value& out, std::string& error) {
   Parser parser(text);
-  if (!parser.parseValue(out)) {
+  if (!parser.parseDocument(out)) {
     error = parser.error();
     return false;
   }

@@ -38,6 +38,8 @@
 #include "src/discovery_job.h"
 #include "src/evidence_store.h"
 #include "src/host_knowledge.h"
+#include "src/nmap_queue.h"
+#include "src/passive_queue.h"
 #include "src/wifi_scanner.h"
 
 namespace {
@@ -118,8 +120,10 @@ reconclave::json::Value announcementToJson(const reconclave::NodeAnnouncement& a
     Value features = Value::makeArray();
     for (const auto& feature : descriptor.features) features.push_back(Value::makeString(feature));
     entry.set("features", features);
-    entry.set("weight", Value::makeNumber(descriptor.weight));
-    entry.set("max_concurrency", Value::makeNumber(descriptor.max_concurrency));
+    Value limits = Value::makeObject();
+    limits.set("weight", Value::makeNumber(descriptor.weight));
+    limits.set("max_concurrency", Value::makeNumber(descriptor.max_concurrency));
+    entry.set("limits", std::move(limits));
     descriptors.push_back(entry);
   }
   payload.set("capability_descriptors", descriptors);
@@ -731,7 +735,10 @@ int main() {
       unlink(kLocalCommandPath);
       if (command.rfind("DISCOVERY ", 0) == 0) {
         std::string start_error;
-        if (discovery.start(command.substr(10), start_error)) {
+        std::istringstream fields(command.substr(10));
+        std::string network, bind_interface, extra;
+        fields >> network >> bind_interface;
+        if (!(fields >> extra) && discovery.start(network, start_error, bind_interface)) {
           appendEvidence("discovery.local.started", discoverySnapshot(discovery.snapshot()));
         }
       } else if (command == "CANCEL") {
@@ -771,6 +778,8 @@ int main() {
       }
     }
     if (nowMillis() >= next_status_write) {
+      reconclave::processNmapImport(host_knowledge, kEvidenceDir);
+      reconclave::processPassiveImport(host_knowledge, kEvidenceDir);
       const auto job = discovery.snapshot();
       if (!job.job_id.empty() && job.status != "running" &&
           job.job_id != last_evidenced_job_id) {

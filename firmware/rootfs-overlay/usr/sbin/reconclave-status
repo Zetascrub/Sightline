@@ -24,6 +24,11 @@ if pidof sshd >/dev/null 2>&1; then
 else
 	echo "  sshd: stopped"
 fi
+if pidof telnetd >/dev/null 2>&1; then
+	echo "  WARNING: telnetd is running (expected disabled)"
+else
+	echo "  telnetd: disabled"
+fi
 
 echo
 /usr/sbin/reconclave-trust status 2>/dev/null || echo "Execution trust: unavailable"
@@ -31,6 +36,20 @@ echo
 echo
 echo "Storage:"
 df -h / /root/reconclave 2>/dev/null | awk 'NR == 1 || !seen[$1]++'
+
+echo
+echo "Assessment:"
+if command -v reconclave-mission >/dev/null 2>&1; then
+	reconclave-mission status 2>/dev/null || echo "  status unavailable"
+fi
+
+echo
+echo "Field tools:"
+if command -v reconclave-capabilities >/dev/null 2>&1; then
+	reconclave-capabilities | sed '1d; s/^/  /'
+else
+	echo "  Capability inventory unavailable."
+fi
 
 echo
 echo "Power:"

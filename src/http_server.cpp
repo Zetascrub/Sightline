@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -110,6 +111,17 @@ bool HttpServer::acceptAndHandle(const HttpHandler& handler) {
   // benefit.
   int one = 1;
   setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+  // This runs in the single main-loop thread, so a peer that opens a
+  // connection and then stalls (sends a partial request, or nothing) would
+  // otherwise block recv() forever and freeze everything else - mDNS, UI
+  // status, evidence writes. A per-call deadline turns that into a dropped
+  // request: on timeout recv() returns -1, which readUntil()/readExactly()
+  // already treat as a dead connection.
+  struct timeval deadline {};
+  deadline.tv_sec = 5;
+  setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline));
+  setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline));
 
   std::string buffer;
   HttpResponse response;

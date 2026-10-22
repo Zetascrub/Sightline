@@ -54,6 +54,7 @@ void lv_linux_drm_set_rotation(lv_display_t* disp, int rotation);
 #include <cstdio>
 #include <csignal>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
@@ -76,7 +77,10 @@ void lv_linux_drm_set_rotation(lv_display_t* disp, int rotation);
 #include "src/ble_bridge.h"
 #include "src/wifi_scanner.h"
 #include "src/evidence_store.h"
+#include "src/evidence_browser.h"
+#include "src/ui_jobs.h"
 #include "src/host_knowledge.h"
+#include "src/asset_view.h"
 #include "src/json.h"
 #include "src/camera_capture.h"
 #include "src/tca8418_keyboard.h"
@@ -110,8 +114,35 @@ void handleSignal(int) { g_running = 0; }
 std::vector<reconclave::WifiObservation> g_last_wifi_scan;
 lv_obj_t* g_wifi_list = nullptr;
 lv_obj_t* g_wifi_status = nullptr;
+lv_obj_t* g_wifi_scan_button = nullptr;
+lv_obj_t* g_setup_scan_button = nullptr;
+std::thread g_survey_thread;
+std::atomic<bool> g_survey_done{false};
+std::vector<reconclave::WifiObservation> g_survey_results;
+std::string g_survey_error;
+bool g_survey_ok = false;
+bool g_survey_for_setup = false;
 lv_obj_t* g_evidence_status = nullptr;
 lv_obj_t* g_evidence_summary = nullptr;
+lv_obj_t* g_evidence_browser = nullptr;
+lv_obj_t* g_evidence_list = nullptr;
+lv_obj_t* g_evidence_preview = nullptr;
+lv_obj_t* g_evidence_page = nullptr;
+lv_obj_t* g_evidence_previous = nullptr;
+lv_obj_t* g_evidence_next = nullptr;
+lv_obj_t* g_evidence_filter = nullptr;
+lv_obj_t* g_evidence_cancel = nullptr;
+lv_obj_t* g_evidence_export = nullptr;
+lv_obj_t* g_evidence_manifest = nullptr;
+std::vector<reconclave::EvidenceFile> g_evidence_files;
+std::size_t g_evidence_offset = 0;
+std::thread g_evidence_worker;
+std::atomic<bool> g_evidence_done{false};
+std::atomic<bool> g_evidence_cancel_requested{false};
+bool g_evidence_busy = false;
+std::mutex g_evidence_message_mutex;
+std::string g_evidence_message;
+
 lv_obj_t* g_network_details = nullptr;
 lv_obj_t* g_network_summary = nullptr;
 lv_obj_t* g_recon_details = nullptr;
@@ -120,6 +151,13 @@ lv_obj_t* g_vision_status = nullptr;
 lv_obj_t* g_vision_screen = nullptr;
 lv_obj_t* g_settings_trust_status = nullptr;
 lv_obj_t* g_battery_details = nullptr;
+lv_obj_t* g_settings_list = nullptr;
+lv_obj_t* g_settings_screen = nullptr;
+lv_obj_t* g_settings_everyday_tab = nullptr;
+lv_obj_t* g_settings_more_tab = nullptr;
+std::vector<lv_obj_t*> g_settings_everyday_items;
+std::vector<lv_obj_t*> g_settings_more_items;
+bool g_settings_show_more = false;
 lv_obj_t* g_screenshot_status = nullptr;
 lv_obj_t* g_screenshot_action_status = nullptr;
 pid_t g_screenshot_pid = -1;
@@ -199,11 +237,77 @@ std::uint64_t g_ble_rendered_generation = ~std::uint64_t{0};
 std::string g_project_id{"UNASSIGNED"};
 std::string g_engagement_id{"UNASSIGNED"};
 std::string g_operator_id{"LOCAL"};
+reconclave::UiJobs g_jobs;
+using reconclave::UiJob;
+reconclave::EvidenceContext g_capture_context, g_nmap_context, g_screenshot_context;
+reconclave::EvidenceContext g_survey_context, g_last_wifi_context;
+reconclave::GnssFix g_last_wifi_fix;
+std::string g_screenshot_path;
+bool g_evidence_ok = false;
+bool g_evidence_was_cancelled = false;
+bool g_evidence_cancellable = false;
+lv_obj_t* g_evidence_session_export = nullptr;
+lv_obj_t* g_jobs_screen = nullptr;
+lv_obj_t* g_jobs_summary = nullptr;
+lv_obj_t* g_jobs_rows[5]{};
+lv_obj_t* g_jobs_cancel[5]{};
+lv_obj_t* g_jobs_remote = nullptr;
+lv_obj_t* g_home_jobs = nullptr;
+
+reconclave::EvidenceContext currentContext() {
+  return {g_project_id, g_engagement_id, g_operator_id};
+}
+
+std::string uniqueArtifactPath(const char* prefix, const char* extension) {
+  static unsigned sequence = 0;
+  return std::string(kEvidenceDir) + "/" + prefix + "-" + std::to_string(std::time(nullptr)) +
+         "-" + std::to_string(getpid()) + "-" + std::to_string(++sequence) + extension;
+}
+
+std::string attributeArtifact(const std::string& path, const reconclave::EvidenceContext& context) {
+  const std::string prefix = std::string(kEvidenceDir) + "/";
+  if (path.rfind(prefix, 0) != 0) return "\nSession metadata unavailable: no artifact path.";
+  std::string error;
+  if (!reconclave::attributeEvidenceFile(kEvidenceDir, path.substr(prefix.size()), context, error))
+    return "\nArtifact saved, but session metadata failed: " + error;
+  return {};
+}
+
+std::string artifactFromOutput(const std::string& output) {
+  std::istringstream lines(output);
+  std::string line, result;
+  const std::string prefix = std::string(kEvidenceDir) + "/";
+  while (std::getline(lines, line)) {
+    if (line.rfind("SAVED ", 0) == 0) line.erase(0, 6);
+    if (line.rfind(prefix, 0) == 0) result = line;
+  }
+  return result;
+}
+
+std::vector<std::string> savedArtifactsFromOutput(const std::string& output) {
+  std::vector<std::string> paths;
+  std::istringstream lines(output);
+  std::string line;
+  const std::string prefix = std::string(kEvidenceDir) + "/";
+  while (std::getline(lines, line)) {
+    if (line.rfind("SAVED ", 0) != 0) continue;
+    line.erase(0, 6);
+    if (line.rfind(prefix, 0) == 0 &&
+        std::find(paths.begin(), paths.end(), line) == paths.end()) paths.push_back(line);
+  }
+  return paths;
+}
+
 lv_obj_t* g_session_status = nullptr;
 lv_obj_t* g_node_details = nullptr;
 lv_obj_t* g_node_trust = nullptr;
 lv_obj_t* g_node_job = nullptr;
 lv_obj_t* g_recon_action_status = nullptr;
+lv_obj_t* g_asset_search = nullptr;
+lv_obj_t* g_asset_count = nullptr;
+reconclave::AssetFilter g_asset_filter = reconclave::AssetFilter::All;
+reconclave::AssetSort g_asset_sort = reconclave::AssetSort::Address;
+std::string g_asset_render_key;
 bool g_lan_survey_armed = false;
 std::time_t g_lan_survey_armed_at = 0;
 std::string g_backlight_path;
@@ -217,7 +321,18 @@ pid_t g_capture_pid = -1;
 std::string g_capture_preset;
 lv_obj_t* g_nmap_output = nullptr;
 lv_obj_t* g_nmap_scope = nullptr;
+lv_obj_t* g_nmap_target_field = nullptr;
+lv_obj_t* g_nmap_profile_choice = nullptr;
+lv_obj_t* g_nmap_resume_button = nullptr;
+std::string g_scan_profile{"balanced"};
+std::string g_scan_interface;
+lv_obj_t* g_nmap_interface_choice = nullptr;
+lv_obj_t* g_assets_interface_choice = nullptr;
 pid_t g_nmap_pid = -1;
+std::string g_mission_seen_id;
+std::string g_mission_seen_state;
+std::string g_mission_seen_stage;
+std::vector<std::pair<std::string, reconclave::EvidenceContext>> g_nmap_import_receipts;
 reconclave::Tca8418Keyboard g_keyboard;
 bool g_keyboard_ready = false;
 bool g_keyboard_shift = false;
@@ -415,22 +530,33 @@ void refreshBluetoothDetails(lv_timer_t*) {
 lv_obj_t* g_recon_host_list = nullptr;
 lv_obj_t* g_findings_list = nullptr;
 lv_obj_t* g_findings_status = nullptr;
+std::string g_findings_render_key{"unrendered"};
+bool g_findings_show_changes = false;
+lv_obj_t* g_findings_service_tab = nullptr;
+lv_obj_t* g_findings_changes_tab = nullptr;
 lv_obj_t* g_recon_screen = nullptr;
 lv_obj_t* g_findings_screen = nullptr;
 lv_obj_t* g_findings_return = nullptr;
 lv_obj_t* g_host_detail_screen = nullptr;
 lv_obj_t* g_host_detail_title = nullptr;
 lv_obj_t* g_host_detail_body = nullptr;
+lv_obj_t* g_host_detail_card = nullptr;
 lv_obj_t* g_host_detail_status = nullptr;
 lv_obj_t* g_host_detail_recheck_button = nullptr;
+lv_obj_t* g_host_detail_toggle_label = nullptr;
 lv_obj_t* g_host_detail_return = nullptr;
 std::string g_host_detail_address;
+bool g_host_detail_technical = false;
 
 void refreshEvidenceSummary();
+void refreshEvidenceBrowser();
+void cancelTrackedJob(UiJob job);
 void refreshReconHostList();
+void exportAssetInventory();
 void refreshFindingsList();
 void populateHostDetail(const std::string& address);
 void showHostDetail(const std::string& address, lv_obj_t* return_screen);
+void showSettingsPage(bool more);
 // Builds a "< back" button identical in style to reconclave::ui::addBackButton,
 // but resolving its destination at click time via `target` rather than a
 // fixed screen fixed at construction - for the RECON -> Findings -> Host
@@ -443,17 +569,19 @@ void openPhotoViewer();
 void refreshWifiSetupList();
 void showWifiPasswordScreen(const std::string& ssid);
 std::string readFirstLine(const std::string& path);
+void updateNmapScopeLabel();
 std::string readDeviceInfo();
 void refreshDeviceDetails();
 int arpNeighbourCount();
 
-std::string attachedIpv4Network() {
+std::string attachedIpv4Network(const char* preferred_interface = nullptr) {
   ifaddrs* addrs = nullptr;
   if (getifaddrs(&addrs) != 0) return {};
   std::string result;
   for (ifaddrs* it = addrs; it != nullptr; it = it->ifa_next) {
-    if (!it->ifa_addr || !it->ifa_netmask || it->ifa_addr->sa_family != AF_INET ||
+    if (!it->ifa_name || !it->ifa_addr || !it->ifa_netmask || it->ifa_addr->sa_family != AF_INET ||
         (it->ifa_flags & IFF_LOOPBACK) != 0 || (it->ifa_flags & IFF_UP) == 0) continue;
+    if (preferred_interface && std::strcmp(it->ifa_name, preferred_interface) != 0) continue;
     const auto address = ntohl(reinterpret_cast<sockaddr_in*>(it->ifa_addr)->sin_addr.s_addr);
     const auto mask = ntohl(reinterpret_cast<sockaddr_in*>(it->ifa_netmask)->sin_addr.s_addr);
     unsigned prefix = 0;
@@ -482,6 +610,22 @@ bool sendLocalCommand(const std::string& command) {
   return output.good() && rename(temporary.c_str(), kLocalCommandPath) == 0;
 }
 
+unsigned scanInterfaceIndex() {
+  return g_scan_interface == "eth0" ? 1U : g_scan_interface == "wlan0" ? 2U : 0U;
+}
+
+void selectScanInterface(unsigned index) {
+  g_scan_interface = index == 1 ? "eth0" : index == 2 ? "wlan0" : "";
+  g_lan_survey_armed = false;
+  if (g_nmap_interface_choice) lv_dropdown_set_selected(g_nmap_interface_choice, scanInterfaceIndex());
+  if (g_assets_interface_choice) lv_dropdown_set_selected(g_assets_interface_choice, scanInterfaceIndex());
+  if (g_nmap_target_field) {
+    const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+    lv_textarea_set_text(g_nmap_target_field, attachedIpv4Network(iface).c_str());
+  }
+  updateNmapScopeLabel();
+}
+
 void requestLanSurvey() {
   const std::time_t now = std::time(nullptr);
   if (!g_lan_survey_armed || now - g_lan_survey_armed_at > 5) {
@@ -492,11 +636,17 @@ void requestLanSurvey() {
     return;
   }
   g_lan_survey_armed = false;
-  const std::string network = attachedIpv4Network();
+  const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+  const std::string network = attachedIpv4Network(iface);
   if (network.empty()) {
     lv_label_set_text(g_recon_action_status, "No active IPv4 network is available.");
-  } else if (sendLocalCommand("DISCOVERY " + network)) {
-    const std::string message = "Survey started: " + network + "  |  progress in Node & Jobs";
+  } else if (iface && readFirstLine("/sys/class/net/" + g_scan_interface + "/operstate") != "up") {
+    lv_label_set_text(g_recon_action_status, "Selected interface is down.");
+  } else if (sendLocalCommand("DISCOVERY " + network +
+                              (iface ? " " + g_scan_interface : ""))) {
+    const std::string message = "Survey started: " + network + " via " +
+                                (iface ? g_scan_interface : "automatic route") +
+                                "  |  progress in Node & Jobs";
     lv_label_set_text(g_recon_action_status, message.c_str());
   } else {
     lv_label_set_text(g_recon_action_status, "Unable to contact the local node service.");
@@ -535,10 +685,13 @@ std::string reconDashboardText() {
   knowledge.load(error);
   const auto hosts = knowledge.snapshot();
   std::ostringstream out;
-  out << "TARGET NETWORK   " << (attachedIpv4Network().empty() ? "offline" : attachedIpv4Network())
-      << "     PASSIVE NEIGHBOURS   " << arpNeighbourCount() << "\n";
-  out << "KNOWN HOSTS      " << hosts.size() << "     REVIEW ITEMS         "
-      << knowledge.attentionCount();
+  const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+  const std::string target = attachedIpv4Network(iface);
+  out << "Network: " << (target.empty() ? "offline" : target)
+      << "  via " << (iface ? iface : "automatic route") << "\n";
+  out << hosts.size() << " saved assets  |  "
+      << reconclave::selectAssets(hosts, "", reconclave::AssetFilter::Review, reconclave::AssetSort::Address).size()
+      << " need review";
   return out.str();
 }
 
@@ -956,7 +1109,7 @@ void readHardwareKeyboard(lv_indev_t*, lv_indev_data_t* data) {
 void addDynamicBackButton(lv_obj_t* screen, lv_obj_t** target, lv_obj_t* fallback) {
   using namespace reconclave::ui;
   lv_obj_t* button = lv_button_create(screen);
-  lv_obj_set_size(button, 84, kBackButtonHeight);
+  lv_obj_set_size(button, 96, kBackButtonHeight);
   lv_obj_align(button, LV_ALIGN_TOP_LEFT, kSafeMargin, kSafeMargin + kStatusBarHeight + 8);
   lv_obj_set_style_bg_color(button, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_border_color(button, lv_color_hex(kColorAccent), 0);
@@ -976,7 +1129,7 @@ void addDynamicBackButton(lv_obj_t* screen, lv_obj_t** target, lv_obj_t* fallbac
   }, LV_EVENT_DELETE, back_target);
 
   lv_obj_t* label = lv_label_create(button);
-  lv_label_set_text(label, LV_SYMBOL_LEFT " back");
+  lv_label_set_text(label, LV_SYMBOL_LEFT " Back");
   lv_obj_set_style_text_color(label, lv_color_hex(kColorAccent), 0);
   lv_obj_center(label);
 }
@@ -1023,10 +1176,7 @@ std::string csvField(const std::string& value) {
   return escaped;
 }
 
-void runWifiScan() {
-  std::string error;
-  bool ok = reconclave::scanWifi("wlan0", g_last_wifi_scan, error);
-
+void renderWifiSurvey() {
   std::sort(g_last_wifi_scan.begin(), g_last_wifi_scan.end(), [](const auto& left, const auto& right) {
     return left.rssi_dbm > right.rssi_dbm;
   });
@@ -1048,7 +1198,7 @@ void runWifiScan() {
     lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_set_style_shadow_width(row, 0, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_layout(row, LV_LAYOUT_NONE);
 
     lv_obj_t* row_label = lv_label_create(row);
@@ -1082,16 +1232,71 @@ void runWifiScan() {
   }
 
   std::string status;
-  if (ok) {
+  if (g_survey_ok) {
     const auto survey = reconclave::analyseWifi(g_last_wifi_scan);
     status = std::to_string(survey.total) + " APs  |  " + std::to_string(survey.two_ghz) + " x 2.4G  " +
              std::to_string(survey.five_ghz) + " x 5G  |  open " + std::to_string(survey.open) +
              "  hidden " + std::to_string(survey.hidden) + "  |  best ch " +
              std::to_string(survey.best_24_channel);
   } else {
-    status = "Scan failed: " + error;
+    status = "Scan failed: " + g_survey_error;
   }
   lv_label_set_text(g_wifi_status, status.c_str());
+}
+
+// The worker owns temporary results; only the UI thread publishes them and
+// touches widgets. Share the Wi-Fi operation gate with connect/disconnect.
+void finishWifiSurvey(lv_timer_t*) {
+  if (!g_survey_done.exchange(false, std::memory_order_acquire)) return;
+  g_survey_thread.join();
+  g_jobs.finish(UiJob::Wifi, g_survey_ok, g_survey_ok ?
+      std::to_string(g_survey_results.size()) + " networks found" : g_survey_error);
+  g_wifi_op_running.store(false);
+  lv_obj_remove_state(g_wifi_scan_button, LV_STATE_DISABLED);
+  lv_obj_remove_state(g_setup_scan_button, LV_STATE_DISABLED);
+  lv_obj_t* status = g_survey_for_setup ? g_wifisetup_status : g_wifi_status;
+  if (!g_survey_ok) {
+    const std::string message = "Scan failed: " + g_survey_error +
+        ". Tap Scan to retry. Previous results kept.";
+    lv_label_set_text(status, message.c_str());
+    return;
+  }
+  if (g_survey_for_setup) {
+    g_wifisetup_scan = std::move(g_survey_results);
+    refreshWifiSetupList();
+    lv_label_set_text(status, g_wifisetup_scan.empty()
+        ? "No networks found. Move closer to an access point and scan again."
+        : "Choose a secured network to connect. Strongest signals appear first.");
+  } else {
+    g_last_wifi_scan = std::move(g_survey_results);
+    g_last_wifi_context = g_survey_context;
+    g_last_wifi_fix = g_gnss.fix();
+    renderWifiSurvey();
+    if (g_last_wifi_scan.empty())
+      lv_label_set_text(status, "No networks found. Move closer to an access point and scan again.");
+  }
+}
+
+void runWifiScan(bool setup = false) {
+  lv_obj_t* status = setup ? g_wifisetup_status : g_wifi_status;
+  if (g_wifi_op_running.exchange(true)) {
+    lv_label_set_text(status, "Wi-Fi is busy. Wait for the current operation to finish.");
+    return;
+  }
+  g_survey_for_setup = setup;
+  g_survey_context = currentContext();
+  g_jobs.begin(UiJob::Wifi, setup ? "Finding networks to join" : "Surveying nearby networks");
+  lv_label_set_text(status, "Scanning nearby networks... You can continue using other tools.");
+  lv_obj_add_state(g_wifi_scan_button, LV_STATE_DISABLED);
+  lv_obj_add_state(g_setup_scan_button, LV_STATE_DISABLED);
+  g_survey_thread = std::thread([] {
+    g_survey_results.clear();
+    g_survey_error.clear();
+    g_survey_ok = reconclave::scanWifi("wlan0", g_survey_results, g_survey_error);
+    std::sort(g_survey_results.begin(), g_survey_results.end(),
+        [](const auto& a, const auto& b) { return a.rssi_dbm > b.rssi_dbm; });
+    g_survey_done.store(true, std::memory_order_release);
+  });
 }
 
 void exportWifiEvidence() {
@@ -1112,10 +1317,7 @@ void exportWifiEvidence() {
     return;
   }
 
-  std::time_t now = std::time(nullptr);
-  char timestamp[32];
-  std::strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", std::localtime(&now));
-  std::string path = std::string(kEvidenceDir) + "/wifi-" + timestamp + ".csv";
+  const std::string path = uniqueArtifactPath("wifi", ".csv");
 
   std::ofstream file(path);
   if (!file) {
@@ -1123,9 +1325,9 @@ void exportWifiEvidence() {
     return;
   }
   file << "project_id,engagement_id,operator_id,ssid,bssid,channel,frequency_mhz,band,rssi_dbm,quality_percent,security,observer_node,latitude,longitude,location_valid\n";
-  const auto& fix = g_gnss.fix();
+  const auto& fix = g_last_wifi_fix;
   for (const auto& ap : g_last_wifi_scan) {
-    file << csvField(g_project_id) << "," << csvField(g_engagement_id) << "," << csvField(g_operator_id)
+    file << csvField(g_last_wifi_context.project_id) << "," << csvField(g_last_wifi_context.engagement_id) << "," << csvField(g_last_wifi_context.operator_id)
          << "," << csvField(ap.ssid) << "," << ap.bssid << "," << ap.channel << "," << ap.frequency_mhz << ","
          << (ap.channel > 14 ? "5GHz" : "2.4GHz") << "," << ap.rssi_dbm << "," << ap.quality_percent << ","
          << ap.security << "," << kDeviceId << ",";
@@ -1133,8 +1335,13 @@ void exportWifiEvidence() {
     else file << ",,false\n";
   }
   file.close();
+  if (!file.good()) {
+    unlink(path.c_str());
+    lv_label_set_text(g_evidence_status, "Write failed. Check free storage and retry.");
+    return;
+  }
 
-  std::string status = "Saved " + std::to_string(g_last_wifi_scan.size()) + " networks to " + path;
+  std::string status = "Saved " + std::to_string(g_last_wifi_scan.size()) + " networks to " + path + attributeArtifact(path, g_last_wifi_context);
   lv_label_set_text(g_evidence_status, status.c_str());
   refreshEvidenceSummary();
 }
@@ -1312,10 +1519,8 @@ void captureEvidencePhoto() {
     lv_label_set_text(g_vision_status, "Could not create evidence directory");
     return;
   }
-  std::time_t now = std::time(nullptr);
-  char timestamp[32];
-  std::strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", std::localtime(&now));
-  const std::string path = std::string(kEvidenceDir) + "/photo-" + timestamp + ".jpg";
+  const auto context = currentContext();
+  const std::string path = uniqueArtifactPath("photo", ".jpg");
 
   lv_label_set_text(g_vision_status, "Capturing...");
   lv_refr_now(nullptr);
@@ -1326,7 +1531,7 @@ void captureEvidencePhoto() {
   }
   showLastPhoto(path, g_vision_preview);
   if (g_vision_preview_hint != nullptr) lv_obj_add_flag(g_vision_preview_hint, LV_OBJ_FLAG_HIDDEN);
-  const std::string status = "Saved " + formatBytes(capture.size_bytes) + " to " + path;
+  const std::string status = "Saved " + formatBytes(capture.size_bytes) + " to " + path + attributeArtifact(path, context);
   lv_label_set_text(g_vision_status, status.c_str());
   refreshEvidenceSummary();
 }
@@ -1407,6 +1612,33 @@ SimpleCommandResult runSimpleCommand(const std::vector<std::string>& argv, int t
   return result;
 }
 
+std::string routeSummaryFor(const std::string& target) {
+  if (target.empty()) return "unavailable";
+  const std::string destination = target.substr(0, target.find('/'));
+  const auto route = runSimpleCommand({"ip", "route", "get", destination}, 1200);
+  if (!route.ok) return "route unavailable";
+  std::istringstream words(route.output);
+  std::string token, iface, source, gateway;
+  while (words >> token) {
+    if (token == "dev") words >> iface;
+    else if (token == "src") words >> source;
+    else if (token == "via") words >> gateway;
+  }
+  if (iface.empty()) return "route unavailable";
+  return iface + (source.empty() ? "" : " / " + source) +
+         (gateway.empty() ? "" : " via " + gateway);
+}
+
+std::string configuredDnsResolver() {
+  std::ifstream resolv("/etc/resolv.conf");
+  std::string line, token, value;
+  while (std::getline(resolv, line)) {
+    std::istringstream fields(line);
+    if (fields >> token >> value && token == "nameserver") return value;
+  }
+  return "none configured";
+}
+
 struct WifiLinkStatus { bool associated = false; std::string ssid; std::string ip; };
 
 WifiLinkStatus currentWifiLinkStatus() {
@@ -1446,10 +1678,10 @@ WifiLinkStatus currentWifiLinkStatus() {
 void runWifiOpAsync(std::function<void()> work) {
   if (g_wifi_op_running.exchange(true)) return;
   if (g_wifi_op_thread.joinable()) g_wifi_op_thread.join();
+  g_jobs.begin(UiJob::Wifi, "Updating Wi-Fi connection");
   g_wifi_op_thread = std::thread([work]() {
     work();
     g_wifi_op_generation.fetch_add(1, std::memory_order_release);
-    g_wifi_op_running.store(false, std::memory_order_release);
   });
 }
 
@@ -1493,28 +1725,92 @@ void startWifiDisconnect() {
     // `killall wpa_supplicant` while it's still mid-association/retry is
     // what actually caused a device hang once (see README), not Wi-Fi
     // interface cycling in general.
-    runSimpleCommand({"ifdown", "wlan0"}, 10000);
+    const auto result = runSimpleCommand({"ifdown", "wlan0"}, 10000);
     std::lock_guard<std::mutex> lock(g_wifi_op_mutex);
-    g_wifi_op_ok = false;
-    g_wifi_op_message = "Disconnected";
+    g_wifi_op_ok = result.ok;
+    g_wifi_op_message = result.ok ? "Disconnected" : "Disconnect failed: " + result.output;
   });
 }
 
+void setEvidenceProgress(const std::string& message) {
+  std::lock_guard<std::mutex> lock(g_evidence_message_mutex);
+  g_evidence_message = message;
+}
+
+void startEvidenceTask(std::function<std::string()> work, bool cancellable) {
+  if (g_evidence_busy) return;
+  g_evidence_busy = true;
+  g_evidence_ok = false;
+  g_evidence_was_cancelled = false;
+  g_evidence_cancellable = cancellable;
+  g_jobs.begin(UiJob::Evidence, cancellable ? "Exporting evidence" : "Verifying timeline and manifest");
+  lv_obj_add_state(g_evidence_session_export, LV_STATE_DISABLED);
+  g_evidence_cancel_requested.store(false);
+  lv_obj_add_state(g_evidence_export, LV_STATE_DISABLED);
+  lv_obj_add_state(g_evidence_manifest, LV_STATE_DISABLED);
+  if (cancellable) lv_obj_remove_state(g_evidence_cancel, LV_STATE_DISABLED);
+  setEvidenceProgress(cancellable ? "Preparing store export..." : "Verifying timeline and building manifest...");
+  g_evidence_worker = std::thread([work] {
+    try { setEvidenceProgress(work()); }
+    catch (const std::exception& e) { g_evidence_ok = false; setEvidenceProgress(std::string("Evidence operation failed: ") + e.what()); }
+    g_evidence_done.store(true, std::memory_order_release);
+  });
+}
+
+void pollEvidenceTask(lv_timer_t*) {
+  if (!g_evidence_busy) return;
+  const bool done = g_evidence_done.exchange(false, std::memory_order_acquire);
+  if (done) {
+    g_evidence_worker.join();
+    g_evidence_busy = false;
+    {
+      std::lock_guard<std::mutex> lock(g_evidence_message_mutex);
+      g_jobs.finish(UiJob::Evidence, g_evidence_ok, g_evidence_message,
+          g_evidence_was_cancelled);
+    }
+    lv_obj_remove_state(g_evidence_session_export, LV_STATE_DISABLED);
+    lv_obj_remove_state(g_evidence_export, LV_STATE_DISABLED);
+    lv_obj_remove_state(g_evidence_manifest, LV_STATE_DISABLED);
+    lv_obj_add_state(g_evidence_cancel, LV_STATE_DISABLED);
+    refreshEvidenceSummary();
+  }
+  std::lock_guard<std::mutex> lock(g_evidence_message_mutex);
+  lv_label_set_text(g_evidence_status, g_evidence_message.c_str());
+}
+
 void createEvidenceManifest() {
-  reconclave::EvidenceStore evidence(kEvidenceDir, kDeviceId);
-  reconclave::json::Value manifest;
-  std::string error;
-  if (!evidence.createManifest(reconclave::loadEvidenceContext(kSessionPath), kFirmware,
-                               manifest, error)) {
-    const std::string status = "Manifest blocked: " + error;
-    lv_label_set_text(g_evidence_status, status.c_str());
+  const reconclave::EvidenceContext context{g_project_id, g_engagement_id, g_operator_id};
+  startEvidenceTask([context] {
+    reconclave::EvidenceStore evidence(kEvidenceDir, kDeviceId);
+    reconclave::json::Value manifest;
+    std::string error;
+    if (!evidence.createManifest(context, kFirmware, manifest, error))
+      return "Manifest blocked: " + error;
+    g_evidence_ok = true;
+    const auto* hash = manifest.find("manifest_hash");
+    return std::string("Timeline verified; manifest saved. Hash: ") +
+        (hash ? hash->asString().substr(0, 12) : "unknown");
+  }, false);
+}
+
+void exportEvidenceStore(bool session_only = false) {
+  if (g_capture_pid > 0 || g_nmap_pid > 0 || g_screenshot_pid > 0) {
+    lv_label_set_text(g_evidence_status, "Finish active captures and scans before exporting the store.");
     return;
   }
-  const auto* hash = manifest.find("manifest_hash");
-  const std::string short_hash = hash ? hash->asString().substr(0, 12) : "unknown";
-  const std::string status = "Manifest verified and saved  |  " + short_hash;
-  lv_label_set_text(g_evidence_status, status.c_str());
-  refreshEvidenceSummary();
+  const reconclave::EvidenceContext context{g_project_id, g_engagement_id, g_operator_id};
+  startEvidenceTask([context, session_only] {
+    std::string path, error;
+    const bool ok = reconclave::exportEvidenceBundle(kEvidenceDir, context,
+        [](std::size_t done, std::size_t total) {
+          setEvidenceProgress("Exporting " + std::to_string(done) + " / " + std::to_string(total) +
+                              " files. You can use other screens.");
+          return !g_evidence_cancel_requested.load();
+        }, path, error, session_only);
+    g_evidence_ok = ok;
+    g_evidence_was_cancelled = !ok && error.rfind("Export cancelled.", 0) == 0;
+    return ok ? "Store exported with SHA-256 manifest:\n" + path : error;
+  }, true);
 }
 
 void startUiScreenshot(lv_obj_t* status) {
@@ -1522,57 +1818,45 @@ void startUiScreenshot(lv_obj_t* status) {
     if (status != nullptr) lv_label_set_text(status, "Screenshot capture already active");
     return;
   }
+  const std::string screenshot_path = uniqueArtifactPath("ui", ".png");
   const pid_t child = fork();
   if (child < 0) {
     if (status != nullptr) lv_label_set_text(status, "Screenshot failed to start");
     return;
   }
   if (child == 0) {
-    execlp("reconclave-screenshot", "reconclave-screenshot", static_cast<char*>(nullptr));
+    execlp("reconclave-screenshot", "reconclave-screenshot", screenshot_path.c_str(), static_cast<char*>(nullptr));
     _exit(127);
   }
   g_screenshot_pid = child;
+  g_screenshot_path = screenshot_path;
+  g_screenshot_context = currentContext();
+  g_jobs.begin(UiJob::Screenshot, "Saving screen image");
   g_screenshot_action_status = status;
   if (status != nullptr) lv_label_set_text(status, "Saving UI screenshot to evidence...");
 }
 
 void refreshEvidenceSummary() {
   if (g_evidence_summary == nullptr) return;
-  DIR* dir = opendir(kEvidenceDir);
-  int files = 0;
-  uint64_t bytes = 0;
-  std::string newest;
-  std::vector<std::string> recent;
-  if (dir != nullptr) {
-    while (dirent* entry = readdir(dir)) {
-      if (entry->d_name[0] == '.') continue;
-      std::string path = std::string(kEvidenceDir) + "/" + entry->d_name;
-      struct stat info {};
-      if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
-      ++files;
-      bytes += static_cast<uint64_t>(info.st_size);
-      recent.push_back(entry->d_name);
-      if (newest.empty() || newest < entry->d_name) newest = entry->d_name;
-    }
-    closedir(dir);
+  std::vector<reconclave::EvidenceFile> files;
+  std::string error;
+  if (!reconclave::listEvidenceFiles(kEvidenceDir, files, error)) {
+    lv_label_set_text(g_evidence_summary, ("Unable to list evidence: " + error).c_str());
+    return;
   }
-  std::sort(recent.begin(), recent.end(), std::greater<std::string>());
-  std::string text = "EVIDENCE STORE\n\n" + std::to_string(files) + " artifacts  //  " + formatBytes(bytes);
-  const reconclave::EvidenceStore evidence(kEvidenceDir, kDeviceId);
-  const auto verification = evidence.verify();
-  text += "\nTimeline: ";
-  if (verification.valid) {
-    text += "CHAIN VERIFIED  //  " + std::to_string(verification.records) + " records";
-  } else {
-    text += "FAILED at record " + std::to_string(verification.first_invalid_record);
-  }
-  text += "\n\nRECENT ARTIFACTS";
-  if (recent.empty()) {
-    text += "\nNo captures saved yet";
-  } else {
-    const std::size_t shown = std::min<std::size_t>(recent.size(), 7);
-    for (std::size_t i = 0; i < shown; ++i) text += "\n" LV_SYMBOL_FILE "  " + recent[i];
-  }
+  std::uint64_t bytes = 0;
+  for (const auto& file : files) bytes += file.size;
+  std::string text = "YOUR EVIDENCE\n\n" + std::to_string(files.size()) + " files  /  " + formatBytes(bytes);
+  struct statvfs storage {};
+  if (statvfs(kEvidenceDir, &storage) == 0)
+    text += "\nAvailable storage: " + formatBytes(static_cast<std::uint64_t>(storage.f_bavail) * storage.f_frsize);
+  text += "\n\nBrowse files to inspect saved observations.\nVerify + manifest checks the timeline.\n"
+          "Export store creates a TAR archive with hashes of the archived files.\n"
+          "Export current session includes only files with matching saved context.\n\nRECENT FILES";
+  if (files.empty()) text += "\nNo evidence yet. Save a Wi-Fi survey or take a photo to begin.";
+  for (std::size_t i = 0; i < std::min<std::size_t>(files.size(), 5); ++i)
+    text += "\n" + files[i].name + "  (" + formatBytes(files[i].size) + ")";
+
   lv_label_set_text(g_evidence_summary, text.c_str());
 }
 
@@ -1580,33 +1864,32 @@ void refreshNetworkDetails() {
   if (g_network_details == nullptr) return;
   const NetworkState state = networkState();
   const std::string target = attachedIpv4Network();
-  const std::string speed = readFirstLine("/sys/class/net/" + state.iface + "/speed");
+  const std::string ethernet = interfaceIpv4Address("eth0");
+  const std::string wifi = interfaceIpv4Address("wlan0");
+  const std::string scan_path = routeSummaryFor(target);
   const int neighbours = arpNeighbourCount();
   if (g_network_summary != nullptr) {
     std::ostringstream summary;
     summary << (state.connected ? LV_SYMBOL_OK "  LINK ONLINE" : LV_SYMBOL_CLOSE "  LINK OFFLINE")
-            << "\n\nACTIVE INTERFACE\n" << state.iface
-            << "\n\nASSESSMENT SCOPE\n" << (target.empty() ? "No attached IPv4 network" : target)
+            << "\n\nETHERNET / WI-FI\n" << (ethernet.empty() ? "offline" : ethernet)
+            << " / " << (wifi.empty() ? "offline" : wifi)
+            << "\n\nATTACHED NETWORK\n" << (target.empty() ? "No attached IPv4 network" : target)
+            << "\n\nKERNEL SCAN PATH\n" << scan_path
             << "\n\nPASSIVE NEIGHBOURS\n" << neighbours;
     lv_label_set_text(g_network_summary, summary.str().c_str());
   }
   std::ostringstream out;
-  const std::string rx = readFirstLine("/sys/class/net/" + state.iface + "/statistics/rx_bytes");
-  const std::string tx = readFirstLine("/sys/class/net/" + state.iface + "/statistics/tx_bytes");
-  out << "INTERFACE TELEMETRY\n\n"
-      << "IPv4 ADDRESS\n" << state.address << "\n\n"
-      << "MAC ADDRESS\n" << readFirstLine("/sys/class/net/" + state.iface + "/address") << "\n\n"
-      << "LINK STATE\n" << readFirstLine("/sys/class/net/" + state.iface + "/operstate");
-  if (!speed.empty()) out << "  //  " << speed << " Mbps";
-  out << "\n\nDEFAULT ROUTE\n" << state.gateway << "\n\n"
-      << "TRAFFIC RX / TX\n"
-      << formatBytes(std::strtoull(rx.c_str(), nullptr, 10)) << "  /  "
-      << formatBytes(std::strtoull(tx.c_str(), nullptr, 10));
-  const std::string wifi_address = interfaceIpv4Address("wlan0");
-  if (state.iface != "wlan0" && pathExists("/sys/class/net/wlan0")) {
-    out << "\n\nSECONDARY LINK\nwlan0  //  "
-        << (wifi_address.empty() ? readFirstLine("/sys/class/net/wlan0/operstate") : wifi_address);
-  }
+  out << "FIELD CONNECTIONS\n\n"
+      << "ETHERNET  " << (ethernet.empty() ? "no IPv4" : ethernet)
+      << "  /  " << readFirstLine("/sys/class/net/eth0/operstate") << "\n"
+      << "WI-FI       " << (wifi.empty() ? "no IPv4" : wifi)
+      << "  /  " << readFirstLine("/sys/class/net/wlan0/operstate") << "\n\n"
+      << "GATEWAY  " << state.gateway << "\n"
+      << "DNS  " << configuredDnsResolver() << "\n\n"
+      << "PATH TO ATTACHED NETWORK\n" << scan_path << "\n\n"
+      << "DEFAULT EGRESS ROUTE\n" << routeSummaryFor("1.1.1.1") << "\n\n"
+      << "Scan jobs can choose Ethernet or Wi-Fi explicitly.\n"
+      << "External reachability is not tested by this screen.";
   lv_label_set_text(g_network_details, out.str().c_str());
 }
 
@@ -1664,7 +1947,42 @@ void refreshLiveDetails(lv_timer_t*) {
   if (!ui_command.empty()) {
     unlink(kUiCommandPath);
     constexpr char kPrefix[] = "screen ";
-    if (ui_command == "gnss start") {
+    if (ui_command == "evidence screenshot") {
+      startUiScreenshot(g_evidence_status);
+    } else if (ui_command == "evidence export-session") {
+      exportEvidenceStore(true);
+    } else if (ui_command == "evidence export-store") {
+      exportEvidenceStore(false);
+    } else if (ui_command == "assets export") {
+      exportAssetInventory();
+    } else if (ui_command.rfind("assets search ", 0) == 0 && g_asset_search) {
+      lv_textarea_set_text(g_asset_search, ui_command.substr(14, 64).c_str());
+    } else if (ui_command == "assets clear") {
+      if (g_asset_search) lv_textarea_set_text(g_asset_search, "");
+    } else if (ui_command.rfind("assets open ", 0) == 0) {
+      const std::string address = ui_command.substr(12);
+      reconclave::HostKnowledge knowledge(kHostKnowledgePath);
+      std::string error;
+      if (knowledge.load(error)) {
+        const auto hosts = knowledge.snapshot();
+        if (std::any_of(hosts.begin(), hosts.end(), [&](const auto& host) { return host.address == address; }))
+          showHostDetail(address, g_recon_screen);
+      }
+    } else if (ui_command == "assets technical" && !g_host_detail_address.empty()) {
+      g_host_detail_technical = true;
+      populateHostDetail(g_host_detail_address);
+      if (g_host_detail_card != nullptr) lv_obj_scroll_to_y(g_host_detail_card, 0, LV_ANIM_OFF);
+      lv_screen_load(g_host_detail_screen);
+    } else if ((ui_command == "settings more" || ui_command == "settings everyday") && g_settings_screen != nullptr) {
+      showSettingsPage(ui_command == "settings more");
+      lv_screen_load(g_settings_screen);
+    } else if (ui_command == "jobs stop capture") {
+      cancelTrackedJob(UiJob::Capture);
+    } else if (ui_command == "jobs stop nmap") {
+      cancelTrackedJob(UiJob::Nmap);
+    } else if (ui_command == "jobs stop evidence") {
+      cancelTrackedJob(UiJob::Evidence);
+    } else if (ui_command == "gnss start") {
       setGnssRunning(true);
     } else if (ui_command == "gnss stop") {
       setGnssRunning(false);
@@ -1689,15 +2007,14 @@ void refreshLiveDetails(lv_timer_t*) {
   if (g_home_context != nullptr) {
     const NetworkState network = networkState();
     std::ostringstream context;
-    context << "PROJECT\n" << g_project_id << "\n\nENGAGEMENT\n" << g_engagement_id
-            << "\n\nOPERATOR\n" << g_operator_id << "\n\nTARGET\n"
-            << (attachedIpv4Network().empty() ? "OFFLINE" : attachedIpv4Network());
+    const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+    const std::string target = attachedIpv4Network(iface);
+    context << "SCAN NETWORK\n" << (target.empty() ? "Offline" : target)
+            << "\n\nSCAN VIA\n" << (iface ? iface : "Automatic route")
+            << "\n\nPROJECT\n" << g_project_id;
     lv_label_set_text(g_home_context, context.str().c_str());
     std::ostringstream readiness;
-    readiness << (network.connected ? LV_SYMBOL_OK " LINK READY" : LV_SYMBOL_CLOSE " OFFLINE")
-              << "   " << arpNeighbourCount() << " NEIGHBOURS\n"
-              << (g_keyboard_ready ? LV_SYMBOL_KEYBOARD " KEYBOARD" : "TOUCH MODE")
-              << "   " << batteryText();
+    readiness << (network.connected ? LV_SYMBOL_OK " Network ready" : LV_SYMBOL_CLOSE " Offline");
     lv_label_set_text(g_home_readiness, readiness.str().c_str());
   }
   if (g_capture_pid > 0) {
@@ -1707,15 +2024,14 @@ void refreshLiveDetails(lv_timer_t*) {
       g_capture_pid = -1;
       if (g_capture_stop_button != nullptr) lv_obj_add_state(g_capture_stop_button, LV_STATE_DISABLED);
       std::string output = readTextFile("/tmp/reconclave-capture.log");
-      output.erase(std::remove(output.begin(), output.end(), '\n'), output.end());
-      if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        lv_label_set_text(g_capture_status,
-            (LV_SYMBOL_OK " Capture saved\n" + output).c_str());
-        refreshEvidenceSummary();
-      } else {
-        lv_label_set_text(g_capture_status,
-            (LV_SYMBOL_WARNING " Capture failed\n" + output).c_str());
-      }
+      const auto artifact = artifactFromOutput(output);
+      if (!artifact.empty()) output += attributeArtifact(artifact, g_capture_context);
+      const bool stopped = WIFEXITED(status) && WEXITSTATUS(status) == 130;
+      const bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      g_jobs.finish(UiJob::Capture, ok, output, stopped);
+      lv_label_set_text(g_capture_status, ((stopped ? "Capture stopped; recorded data kept\n" :
+          ok ? "Capture saved\n" : "Capture failed\n") + output).c_str());
+      refreshEvidenceSummary();
     }
   }
   if (g_nmap_pid > 0) {
@@ -1723,20 +2039,76 @@ void refreshLiveDetails(lv_timer_t*) {
     if (waitpid(g_nmap_pid, &status, WNOHANG) == g_nmap_pid) {
       g_nmap_pid = -1;
       std::string output = readTextFile("/tmp/reconclave-nmap.log");
+      unsigned imports = 0;
+      for (const auto& artifact : savedArtifactsFromOutput(output)) {
+        output += attributeArtifact(artifact, g_nmap_context);
+        if (artifact.size() > 4 && artifact.substr(artifact.size() - 4) == ".txt") {
+          const auto xml = artifact.substr(0, artifact.size() - 4) + ".xml";
+          if (access(xml.c_str(), F_OK) == 0) {
+            output += attributeArtifact(xml, g_nmap_context);
+            g_nmap_import_receipts.emplace_back(xml + ".import.json", g_nmap_context);
+            ++imports;
+          }
+        } else if (artifact.size() > 5 && artifact.substr(artifact.size() - 5) == ".json" &&
+                   artifact.find("/passive-") != std::string::npos) {
+          g_nmap_import_receipts.emplace_back(artifact + ".import.json", g_nmap_context);
+          ++imports;
+        }
+      }
+      if (imports) output += "\nWaiting for node service to import " + std::to_string(imports) + " scan result(s).";
+      const bool stopped = WIFEXITED(status) && WEXITSTATUS(status) == 130;
+      const bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      g_jobs.finish(UiJob::Nmap, ok, output.substr(0, 1000), stopped);
+      std::string summary;
+      auto done = output.rfind("ASSESSMENT ");
+      if (done == std::string::npos) done = output.rfind("PASSIVE ");
+      if (done == std::string::npos) done = output.rfind("Nmap done:");
+      if (done != std::string::npos) {
+        const auto end = output.find('\n', done);
+        summary = output.substr(done, end == std::string::npos ? std::string::npos : end - done);
+      }
       if (output.size() > 12000) output = output.substr(output.size() - 12000);
+      output = std::string(stopped ? "SCAN STOPPED - results may be partial\n" :
+                           ok ? "SCAN COMPLETE\n" : "SCAN FAILED OR TIMED OUT\n") +
+          (summary.empty() ? "" : summary + "\n") +
+          (ok ? "Next: open Explore on Home to inspect assets.\n" : "Check the saved report for details.\n") +
+          "\nTECHNICAL OUTPUT\n" + output;
       lv_label_set_text(g_nmap_output, output.c_str());
       refreshEvidenceSummary();
+    } else if (g_nmap_output != nullptr) {
+      const auto progress = readTextFile("/tmp/reconclave-nmap.log");
+      if (!progress.empty()) {
+        const auto display = progress.size() > 6000 ? progress.substr(progress.size() - 6000) : progress;
+        lv_label_set_text(g_nmap_output, ("SCAN RUNNING\n\n" + display).c_str());
+      }
     }
+  }
+  for (auto it = g_nmap_import_receipts.begin(); it != g_nmap_import_receipts.end();) {
+    const auto receipt = readTextFile(it->first);
+    reconclave::json::Value result; std::string error;
+    if (!receipt.empty() && reconclave::json::parse(receipt, result, error)) {
+      const auto* state = result.find("status");
+      const auto* count = result.find("hosts_imported");
+      const auto* reason = result.find("error");
+      std::string message = state && state->asString() == "imported"
+          ? "\nAssets updated: " + std::to_string(count ? count->asUInt64() : 0) + " host records processed."
+          : "\nAssets not imported: " + (reason ? reason->asString() : "unknown error") + ". Raw evidence kept.";
+      message += attributeArtifact(it->first, it->second);
+      if (g_nmap_output) lv_label_set_text(g_nmap_output, (std::string(lv_label_get_text(g_nmap_output)) + message).c_str());
+      it = g_nmap_import_receipts.erase(it);
+    } else ++it;
   }
   if (g_screenshot_pid > 0) {
     int status = 0;
     if (waitpid(g_screenshot_pid, &status, WNOHANG) == g_screenshot_pid) {
       g_screenshot_pid = -1;
       const bool saved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      const std::string message = saved ? "Screenshot saved: " + g_screenshot_path +
+          attributeArtifact(g_screenshot_path, g_screenshot_context) : "Screenshot capture failed";
+      g_jobs.finish(UiJob::Screenshot, saved, message);
       if (g_screenshot_action_status != nullptr) {
         lv_label_set_text(g_screenshot_action_status,
-                          saved ? LV_SYMBOL_OK " Screenshot saved to evidence"
-                                : LV_SYMBOL_WARNING " Screenshot capture failed");
+                          message.c_str());
       }
       if (saved) refreshEvidenceSummary();
       g_screenshot_action_status = nullptr;
@@ -1810,10 +2182,12 @@ void refreshLiveDetails(lv_timer_t*) {
     const auto generation = g_wifi_op_generation.load(std::memory_order_acquire);
     if (generation != g_wifi_op_applied_generation) {
       g_wifi_op_applied_generation = generation;
+      g_wifi_op_running.store(false);
       std::string message;
       {
         std::lock_guard<std::mutex> lock(g_wifi_op_mutex);
         message = g_wifi_op_message;
+        g_jobs.finish(UiJob::Wifi, g_wifi_op_ok, message);
       }
       if (g_wifisetup_status != nullptr) lv_label_set_text(g_wifisetup_status, message.c_str());
       if (g_wifi_password_status != nullptr) lv_label_set_text(g_wifi_password_status, message.c_str());
@@ -1839,7 +2213,7 @@ std::string formatEpochMs(std::uint64_t ms) {
 // language as the Wi-Fi scan list rows in runWifiScan().
 lv_obj_t* makeListRow(lv_obj_t* list, std::uint32_t border_color, lv_coord_t height) {
   using namespace reconclave::ui;
-  lv_obj_t* row = lv_obj_create(list);
+  lv_obj_t* row = lv_button_create(list);
   lv_obj_set_size(row, lv_pct(100), height);
   lv_obj_set_style_bg_color(row, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_bg_color(row, lv_color_hex(0x21485a), LV_STATE_PRESSED);
@@ -1877,12 +2251,34 @@ void refreshReconHostList() {
   if (g_recon_host_list == nullptr) return;
   reconclave::HostKnowledge knowledge(kHostKnowledgePath);
   std::string error;
-  knowledge.load(error);
-  const auto hosts = knowledge.snapshot();
+  const bool loaded = knowledge.load(error);
+  const auto all = knowledge.snapshot();
+  const std::string query = g_asset_search ? lv_textarea_get_text(g_asset_search) : "";
+  const auto hosts = reconclave::selectAssets(all, query, g_asset_filter, g_asset_sort);
+  if (g_asset_count) {
+    const auto text = loaded ? std::to_string(hosts.size()) + " / " + std::to_string(all.size()) +
+        " assets  |  Device history, across sessions" : "Inventory unavailable: " + error;
+    lv_label_set_text(g_asset_count, text.c_str());
+  }
+  // Do not destroy focused rows every timer tick when only timestamps change.
+  std::ostringstream key;
+  key << loaded << error << query << static_cast<int>(g_asset_filter) << static_cast<int>(g_asset_sort);
+  for (const auto& host : hosts) {
+    key << host.address << host.mac << host.interface << host.changes << host.hostname
+        << host.passive_source << host.passive_observed_ms
+        << (host.last_seen_ms / 60000);
+    for (auto port : reconclave::assetPorts(host)) key << ':' << port;
+    for (const auto& service : host.services) key << service.port << service.protocol << service.service << service.banner << service.attention;
+  }
+  if (key.str() == g_asset_render_key) return;
+  g_asset_render_key = key.str();
+  const auto scroll = lv_obj_get_scroll_y(g_recon_host_list);
   lv_obj_clean(g_recon_host_list);
-  if (hosts.empty()) {
+  if (!loaded || hosts.empty()) {
     lv_obj_t* empty = lv_label_create(g_recon_host_list);
-    lv_label_set_text(empty, "No hosts accumulated yet. Survey the attached LAN or allow passive observation.");
+    lv_label_set_text(empty, !loaded ? "Could not read inventory. Check device storage and try again." :
+        (all.empty() ? "No assets yet. Connect to an authorised network and choose Survey LAN. Passive neighbours also appear here." :
+                       "No matching assets. Clear the search or choose All assets."));
     lv_obj_set_width(empty, lv_pct(100));
     lv_label_set_long_mode(empty, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_color(empty, lv_color_hex(kColorSecondary), 0);
@@ -1890,41 +2286,43 @@ void refreshReconHostList() {
     return;
   }
   for (const auto& host : hosts) {
-    const bool has_review = std::any_of(host.services.begin(), host.services.end(),
-        [](const auto& service) { return !service.attention.empty(); });
-    lv_obj_t* row = makeListRow(g_recon_host_list, has_review ? kColorAmber : kColorAccent, 58);
+    const bool has_review = reconclave::assetNeedsReview(host);
+    const auto ports = reconclave::assetPorts(host);
+    lv_obj_t* row = makeListRow(g_recon_host_list, has_review ? kColorAmber : kColorAccent, 68);
 
     lv_obj_t* address_label = lv_label_create(row);
-    lv_label_set_text(address_label, host.address.c_str());
-    lv_obj_set_width(address_label, lv_pct(38));
+    lv_label_set_text(address_label, (host.address + (host.hostname.empty() ? "" : "  " + host.hostname)).c_str());
+    lv_obj_set_width(address_label, lv_pct(65));
     lv_label_set_long_mode(address_label, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_font(address_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(address_label, lv_color_hex(kColorForeground), 0);
-    lv_obj_align(address_label, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_align(address_label, LV_ALIGN_TOP_LEFT, 6, 0);
 
     std::ostringstream detail;
-    if (!host.mac.empty()) detail << host.mac << "  ";
-    if (!host.open_ports.empty()) {
-      detail << "TCP ";
-      for (std::size_t i = 0; i < host.open_ports.size(); ++i) {
-        if (i > 0) detail << ',';
-        detail << host.open_ports[i];
-      }
-    } else {
-      detail << "no open ports known";
-    }
-    if (has_review) detail << "  " LV_SYMBOL_WARNING;
+    detail << (ports.empty() ? (host.passive_source.empty() ? "No recorded open TCP ports" : "Seen passively; ports unconfirmed") :
+        std::to_string(ports.size()) + (ports.size() == 1 ? " recorded TCP port" : " recorded TCP ports"));
+    const auto udp = std::count_if(host.services.begin(), host.services.end(), [](const auto& service) { return service.protocol == "udp"; });
+    if (udp) detail << "  |  " << udp << " UDP observations";
+    detail << "  |  Host seen " << formatEpochMs(host.last_seen_ms);
     lv_obj_t* detail_label = lv_label_create(row);
     lv_label_set_text(detail_label, detail.str().c_str());
-    lv_obj_set_width(detail_label, lv_pct(58));
+    lv_obj_set_width(detail_label, lv_pct(88));
     lv_label_set_long_mode(detail_label, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_font(detail_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(detail_label,
-        lv_color_hex(has_review ? kColorAmber : kColorSecondary), 0);
-    lv_obj_align(detail_label, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_set_style_text_color(detail_label, lv_color_hex(kColorSecondary), 0);
+    lv_obj_align(detail_label, LV_ALIGN_BOTTOM_LEFT, 6, 0);
+
+    if (has_review) {
+      lv_obj_t* review_label = lv_label_create(row);
+      lv_label_set_text(review_label, LV_SYMBOL_WARNING "  Review");
+      lv_obj_set_style_text_font(review_label, &lv_font_montserrat_14, 0);
+      lv_obj_set_style_text_color(review_label, lv_color_hex(kColorAmber), 0);
+      lv_obj_align(review_label, LV_ALIGN_TOP_RIGHT, -24, 0);
+    }
 
     attachHostAddress(row, host.address, g_recon_screen);
   }
+  lv_obj_scroll_to_y(g_recon_host_list, scroll, LV_ANIM_OFF);
 }
 
 void refreshFindingsList() {
@@ -1935,14 +2333,51 @@ void refreshFindingsList() {
   knowledge.load(error);
   const auto findings = knowledge.findingsJson();
   const auto* items = findings.find("findings");
-  const auto* count = findings.find("count");
+  std::vector<const reconclave::json::Value*> service_notes;
+  std::vector<const reconclave::json::Value*> history_changes;
+  if (items != nullptr && items->isArray()) {
+    for (const auto& finding : items->items()) {
+      const auto* severity = finding.find("severity");
+      (severity != nullptr && severity->asString() == "review" ? service_notes : history_changes)
+          .push_back(&finding);
+    }
+  }
   if (g_findings_status != nullptr) {
-    const std::string status = std::to_string(count ? count->asUInt64() : 0) +
-        (count && count->asUInt64() == 1 ? " finding requiring review" : " findings requiring review");
+    const std::string status = std::to_string(service_notes.size()) + " service notes to review  |  " +
+        std::to_string(history_changes.size()) + " device changes recorded";
     lv_label_set_text(g_findings_status, status.c_str());
   }
+  std::ostringstream key;
+  key << g_findings_show_changes;
+  for (const auto* item : service_notes) {
+    const auto* title = item->find("title");
+    const auto* address = item->find("address");
+    const auto* port = item->find("port");
+    const auto* last_seen = item->find("last_seen_ms");
+    key << 's' << (title ? title->asString() : "") << (address ? address->asString() : "")
+        << (port ? port->asUInt64() : 0) << (last_seen ? last_seen->asUInt64() / 60000 : 0);
+  }
+  for (const auto* item : history_changes) {
+    const auto* address = item->find("address");
+    const auto* change_count = item->find("change_count");
+    key << 'c' << (address ? address->asString() : "") << (change_count ? change_count->asUInt64() : 0);
+  }
+  if (key.str() == g_findings_render_key) return;
+  g_findings_render_key = key.str();
+  if (g_findings_service_tab != nullptr) {
+    lv_obj_set_style_bg_color(g_findings_service_tab,
+        lv_color_hex(g_findings_show_changes ? kColorPanelLight : kColorAccent), 0);
+    lv_obj_set_style_bg_color(g_findings_changes_tab,
+        lv_color_hex(g_findings_show_changes ? kColorAccent : kColorPanelLight), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(g_findings_service_tab, 0),
+        lv_color_hex(g_findings_show_changes ? kColorForeground : kColorPanel), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(g_findings_changes_tab, 0),
+        lv_color_hex(g_findings_show_changes ? kColorPanel : kColorForeground), 0);
+  }
+  const auto scroll = lv_obj_get_scroll_y(g_findings_list);
   lv_obj_clean(g_findings_list);
-  if (items == nullptr || !items->isArray() || items->items().empty()) {
+  const auto& shown = g_findings_show_changes ? history_changes : service_notes;
+  if (shown.empty()) {
     lv_obj_t* empty = lv_obj_create(g_findings_list);
     lv_obj_set_size(empty, lv_pct(100), 260);
     lv_obj_set_style_bg_color(empty, lv_color_hex(0x091922), 0);
@@ -1961,14 +2396,16 @@ void refreshFindingsList() {
     lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
 
     lv_obj_t* title = lv_label_create(empty);
-    lv_label_set_text(title, "REVIEW QUEUE CLEAR");
+    lv_label_set_text(title, g_findings_show_changes ? "NO DEVICE CHANGES RECORDED" :
+                                                  "NO SERVICE NOTES TO REVIEW");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(kColorForeground), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 52);
 
     lv_obj_t* detail = lv_label_create(empty);
-    lv_label_set_text(detail,
-        "Noteworthy services and changes to known hosts will appear here after discovery.");
+    lv_label_set_text(detail, g_findings_show_changes ?
+        "Device changes will appear here as the inventory evolves." :
+        "Service notes will appear here when an observation needs attention. Use Device changes for history.");
     lv_obj_set_width(detail, 650);
     lv_label_set_long_mode(detail, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_CENTER, 0);
@@ -1984,16 +2421,24 @@ void refreshFindingsList() {
     lv_obj_set_style_border_width(survey, 1, 0);
     lv_obj_set_style_radius(survey, 8, 0);
     lv_obj_set_style_shadow_width(survey, 0, 0);
-    lv_obj_add_event_cb(survey, [](lv_event_t*) {
-      if (g_recon_screen != nullptr) lv_screen_load(g_recon_screen);
-    }, LV_EVENT_CLICKED, nullptr);
+    const bool show_changes = !g_findings_show_changes && !history_changes.empty();
+    lv_obj_add_event_cb(survey, [](lv_event_t* event) {
+      if (lv_event_get_user_data(event) != nullptr) {
+        g_findings_show_changes = true;
+        refreshFindingsList();
+      } else if (g_recon_screen != nullptr) {
+        lv_screen_load(g_recon_screen);
+      }
+    }, LV_EVENT_CLICKED, show_changes ? survey : nullptr);
     lv_obj_t* survey_label = lv_label_create(survey);
-    lv_label_set_text(survey_label, LV_SYMBOL_REFRESH "  OPEN LAN SURVEY");
+    lv_label_set_text(survey_label, show_changes ? "VIEW DEVICE CHANGES" :
+                                                      LV_SYMBOL_REFRESH "  OPEN LAN SURVEY");
     lv_obj_set_style_text_color(survey_label, lv_color_hex(kColorAmber), 0);
     lv_obj_center(survey_label);
     return;
   }
-  for (const auto& finding : items->items()) {
+  for (const auto* entry : shown) {
+    const auto& finding = *entry;
     const auto* severity = finding.find("severity");
     const auto* title = finding.find("title");
     const auto* address = finding.find("address");
@@ -2002,7 +2447,7 @@ void refreshFindingsList() {
     const auto* last_seen = finding.find("last_seen_ms");
     const bool review = severity != nullptr && severity->asString() == "review";
 
-    lv_obj_t* row = makeListRow(g_findings_list, review ? kColorAmber : kColorAccent, 92);
+    lv_obj_t* row = makeListRow(g_findings_list, review ? kColorAmber : kColorAccent, 78);
 
     std::ostringstream heading;
     heading << (review ? LV_SYMBOL_WARNING "  " : LV_SYMBOL_BELL "  ")
@@ -2032,6 +2477,7 @@ void refreshFindingsList() {
 
     if (address != nullptr) attachHostAddress(row, address->asString(), g_findings_screen);
   }
+  lv_obj_scroll_to_y(g_findings_list, scroll, LV_ANIM_OFF);
 }
 
 // Repopulates the Host Detail screen's labels without navigating to it -
@@ -2049,35 +2495,86 @@ void populateHostDetail(const std::string& address) {
 
   std::ostringstream title;
   title << address;
-  if (it != hosts.end() && !it->mac.empty()) title << "   " << it->mac;
+  if (it != hosts.end() && !it->hostname.empty()) title << "  /  " << it->hostname << " (advertised)";
   lv_label_set_text(g_host_detail_title, title.str().c_str());
+  if (g_host_detail_toggle_label != nullptr)
+    lv_label_set_text(g_host_detail_toggle_label, g_host_detail_technical ? "Summary" : "Technical details");
 
   std::ostringstream body;
   if (it == hosts.end()) {
     body << "Host record not found - it may have aged out of the local database.";
-  } else {
-    body << "First seen   " << formatEpochMs(it->first_seen_ms) << "\n";
-    body << "Last seen    " << formatEpochMs(it->last_seen_ms) << "\n";
-    body << "Open ports   ";
-    if (it->open_ports.empty()) {
-      body << "none known (run Survey LAN first)";
-    } else {
-      for (std::size_t i = 0; i < it->open_ports.size(); ++i) {
-        if (i > 0) body << ',';
-        body << it->open_ports[i];
-      }
-    }
-    body << "\n\n";
+  } else if (!g_host_detail_technical) {
+    const auto ports = reconclave::assetPorts(*it);
+    std::uint64_t latest_service_ms = 0;
+    for (const auto& service : it->services)
+      latest_service_ms = std::max(latest_service_ms, service.last_seen_ms);
+    body << "OVERVIEW  /  STORED HISTORY\n"
+         << "Host last seen       " << formatEpochMs(it->last_seen_ms) << "\n"
+         << "Service evidence     " << formatEpochMs(latest_service_ms) << "\n"
+         << "Host last seen via   " << (it->interface.empty() ? "not recorded" : it->interface) << "\n"
+         << "Recorded TCP ports   " << (ports.empty() ? "none confirmed" : std::to_string(ports.size())) << "\n\n"
+         << "SERVICES\n";
     if (it->services.empty()) {
-      body << "No service identification yet. Tap Re-check ports below.";
+      body << (ports.empty() ? "No services identified yet." :
+          "Open ports observed; service names have not been identified yet.") << "\n";
     } else {
+      std::size_t shown = 0;
       for (const auto& service : it->services) {
-        body << "PORT " << service.port << "   " << service.service;
-        if (!service.banner.empty()) body << "   \"" << service.banner << "\"";
-        body << "\n";
-        if (!service.attention.empty()) body << "  " LV_SYMBOL_WARNING "  " << service.attention << "\n";
+        if (shown++ == 6) break;
+        body << service.port << "/" << service.protocol << "  "
+             << (service.service.empty() ? "Unidentified service" : service.service)
+             << (service.attention.empty() ? "" : "  -  review") << "\n";
       }
+      if (it->services.size() > 6) body << "And " << (it->services.size() - 6) << " more in Technical details.\n";
     }
+    body << "\nREVIEW\n";
+    std::size_t notes = 0;
+    for (const auto& service : it->services) {
+      if (service.attention.empty()) continue;
+      if (notes++ == 2) break;
+      body << "- " << service.attention.substr(0, 110) << "\n";
+    }
+    if (notes == 0) body << (it->changes > 0 ? "Observed services changed since an earlier check.\n" :
+                                  "No review notes recorded.\n");
+    else if (it->changes > 0) body << "Observed services have also changed over time.\n";
+    body << "\nStored observations may be incomplete or out of date.\n"
+         << "Use Technical details for sources, coverage and exact responses.";
+  } else {
+    body << "TECHNICAL DETAILS  /  DEVICE HISTORY ACROSS SESSIONS\n";
+    if (!it->hostname.empty()) body << "Advertised hostname  " << it->hostname << "\n";
+    body << "MAC address          " << (it->mac.empty() ? "not recorded" : it->mac) << "\n"
+         << "Interface            " << (it->interface.empty() ? "not recorded" : it->interface) << "\n"
+         << "First observed       " << formatEpochMs(it->first_seen_ms) << "\n"
+         << "Last observed        " << formatEpochMs(it->last_seen_ms) << "\n";
+    if (!it->scan_source.empty())
+      body << "\nLATEST NMAP IMPORT\nCompletion  " << it->scan_completion
+           << "\nObserved    " << formatEpochMs(it->scan_observed_ms)
+           << "\nCoverage    " << it->scan_coverage
+           << "\nEvidence    " << it->scan_source << "\n";
+    if (!it->passive_source.empty())
+      body << "\nPASSIVE SIGHTING\nObserved    " << formatEpochMs(it->passive_observed_ms)
+           << "\nEvidence    " << it->passive_source
+           << "\nOpen ports are never inferred from this sighting.\n";
+    body << "\nCONFIRMED OPEN TCP PORTS\n";
+    if (it->open_ports.empty()) body << "Not established. This does not mean no services exist.\n";
+    else {
+      for (std::size_t i = 0; i < it->open_ports.size(); ++i)
+        body << (i ? ", " : "") << it->open_ports[i];
+      body << "\n";
+    }
+    body << "\nSERVICE EVIDENCE\n";
+    if (it->services.empty()) body << "No service identification recorded.\n";
+    for (const auto& service : it->services) {
+      body << service.protocol << "/" << service.port << "  "
+           << (service.service.empty() ? "unidentified" : service.service)
+           << ((service.method == "table" || (service.method.empty() && service.banner.empty())) ?
+               " [port-based guess]" : " [response classified]");
+      if (!service.banner.empty()) body << "  \"" << service.banner << "\"";
+      body << "\n";
+      if (!service.source.empty()) body << "  Source: " << service.source << "  /  " << formatEpochMs(service.last_seen_ms) << "\n";
+      if (!service.attention.empty()) body << "  Review: " << service.attention << "\n";
+    }
+    body << "\nCoverage is partial. Service labels and banners do not establish a vulnerability.";
   }
   lv_label_set_text(g_host_detail_body, body.str().c_str());
 
@@ -2092,8 +2589,10 @@ void showHostDetail(const std::string& address, lv_obj_t* return_screen) {
   if (g_host_detail_screen == nullptr) return;
   g_host_detail_address = address;
   g_host_detail_return = return_screen;
+  g_host_detail_technical = false;
   populateHostDetail(address);
   if (g_host_detail_status != nullptr) lv_label_set_text(g_host_detail_status, "");
+  if (g_host_detail_card != nullptr) lv_obj_scroll_to_y(g_host_detail_card, 0, LV_ANIM_OFF);
   lv_screen_load(g_host_detail_screen);
 }
 
@@ -2136,6 +2635,14 @@ std::string readDeviceInfo() {
   out << "\n\nREMOTE CLIENTS\nSSH " << (access("/usr/bin/ssh", X_OK) == 0 ? "available" : "missing")
       << "  //  SCP & SFTP "
       << ((access("/usr/bin/scp", X_OK) == 0 && access("/usr/bin/sftp", X_OK) == 0) ? "available" : "missing");
+  out << "\n\nFIELD TOOLKIT\nNmap " << (access("/usr/bin/nmap", X_OK) == 0 ? "ready" : "missing")
+      << "  //  tcpdump " << (access("/usr/sbin/tcpdump", X_OK) == 0 || access("/usr/bin/tcpdump", X_OK) == 0 ? "ready" : "missing")
+      << "\nHTTP/TLS " << (access("/usr/bin/curl", X_OK) == 0 ? "curl" : "no curl")
+      << " / " << (access("/usr/bin/openssl", X_OK) == 0 ? "OpenSSL" : "no OpenSSL")
+      << "  //  DNS " << (access("/usr/bin/dig", X_OK) == 0 ? "dig" : "no dig")
+      << "\nJSON " << (access("/usr/bin/jq", X_OK) == 0 ? "jq" : "no jq")
+      << "  //  sockets " << (access("/usr/bin/socat", X_OK) == 0 ? "socat" : "no socat")
+      << "\nMonitor/injection and USB HID: unverified";
   return out.str();
 }
 
@@ -2152,10 +2659,31 @@ void refreshDeviceDetails() {
   }
 }
 
+void exportAssetInventory() {
+    reconclave::HostKnowledge knowledge(kHostKnowledgePath);
+    std::string error;
+    if (!knowledge.load(error)) {
+      lv_label_set_text(g_recon_action_status, ("Export failed: " + error).c_str()); return;
+    }
+    auto report = knowledge.toJson();
+    report.set("findings", knowledge.findingsJson());
+    report.set("exported_at_ms", reconclave::json::Value::makeNumber(static_cast<double>(std::time(nullptr)) * 1000));
+    const auto path = uniqueArtifactPath("asset-inventory", ".json");
+    std::ofstream output(path);
+    output << reconclave::json::stringify(report) << "\n";
+    output.close();
+    if (!output.good()) {
+      unlink(path.c_str());
+      lv_label_set_text(g_recon_action_status, "Export failed: unable to write evidence file."); return;
+    }
+    const auto status = "Saved device-history inventory to Evidence." + attributeArtifact(path, currentContext());
+    lv_label_set_text(g_recon_action_status, status.c_str());
+}
+
 lv_obj_t* buildReconScreen(lv_obj_t* home) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
-  addStatusBar(screen, "RECON", true);
+  addStatusBar(screen, "ASSETS", networkState().connected);
   addBackButton(screen, home);
 
   // Same row as the back button, right after it - Survey/Cancel stay on
@@ -2172,14 +2700,23 @@ lv_obj_t* buildReconScreen(lv_obj_t* home) {
   lv_obj_set_style_border_width(findings_button, 1, 0);
   lv_obj_set_style_radius(findings_button, 8, 0);
   lv_obj_set_style_shadow_width(findings_button, 0, 0);
-  lv_obj_add_event_cb(findings_button, [](lv_event_t*) {
-    g_findings_return = g_recon_screen;
-    if (g_findings_screen != nullptr) lv_screen_load(g_findings_screen);
-  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(findings_button, [](lv_event_t*) { exportAssetInventory(); }, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* findings_label = lv_label_create(findings_button);
-  lv_label_set_text(findings_label, LV_SYMBOL_WARNING " Findings");
+  lv_label_set_text(findings_label, LV_SYMBOL_DOWNLOAD " Export");
   lv_obj_set_style_text_color(findings_label, lv_color_hex(kColorAmber), 0);
   lv_obj_center(findings_label);
+
+  g_assets_interface_choice = lv_dropdown_create(screen);
+  lv_obj_set_size(g_assets_interface_choice, 196, kBackButtonHeight);
+  lv_obj_align(g_assets_interface_choice, LV_ALIGN_TOP_RIGHT, -kSafeMargin - 130 - 170 - 16,
+               kSafeMargin + kStatusBarHeight + 8);
+  lv_dropdown_set_options(g_assets_interface_choice, "Automatic route\nEthernet / eth0\nWi-Fi / wlan0");
+  lv_obj_add_event_cb(g_assets_interface_choice, [](lv_event_t* event) {
+    selectScanInterface(lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(event))));
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(screen, [](lv_event_t*) {
+    lv_dropdown_set_selected(g_assets_interface_choice, scanInterfaceIndex());
+  }, LV_EVENT_SCREEN_LOADED, nullptr);
 
   lv_obj_t* survey_button = lv_button_create(screen);
   lv_obj_set_size(survey_button, 170, kBackButtonHeight);
@@ -2233,23 +2770,100 @@ lv_obj_t* buildReconScreen(lv_obj_t* home) {
   lv_obj_align(g_recon_details, LV_ALIGN_TOP_LEFT, 0, 0);
 
   g_recon_action_status = lv_label_create(screen);
-  lv_label_set_text(g_recon_action_status, "Observe mode  |  Survey requires two-tap confirmation  |  tap a host below for detail");
+  lv_label_set_text(g_recon_action_status, "Survey checks common TCP ports only. Tap an asset for details and next steps.");
   lv_obj_set_width(g_recon_action_status, contentWidth(screen));
   lv_label_set_long_mode(g_recon_action_status, LV_LABEL_LONG_MODE_DOTS);
   lv_obj_set_style_text_color(g_recon_action_status, lv_color_hex(kColorSecondary), 0);
   lv_obj_set_style_text_font(g_recon_action_status, &lv_font_montserrat_14, 0);
   lv_obj_align(g_recon_action_status, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + kSummaryHeight + kGap);
 
+  const lv_coord_t toolbar_top = kContentTop + kSummaryHeight + kGap + kActionStatusHeight + kGap;
+  g_asset_search = lv_textarea_create(screen);
+  lv_obj_set_size(g_asset_search, 310, 44);
+  lv_obj_align(g_asset_search, LV_ALIGN_TOP_LEFT, kSafeMargin, toolbar_top);
+  lv_textarea_set_one_line(g_asset_search, true);
+  lv_obj_set_style_pad_all(g_asset_search, 10, 0);
+  lv_obj_set_style_text_font(g_asset_search, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_bg_color(g_asset_search, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_text_color(g_asset_search, lv_color_hex(kColorForeground), 0);
+  lv_obj_set_style_border_color(g_asset_search, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(g_asset_search, 1, 0);
+  lv_obj_set_style_radius(g_asset_search, 8, 0);
+  lv_obj_set_style_shadow_width(g_asset_search, 0, 0);
+  lv_obj_set_height(g_asset_search, 44);
+  lv_textarea_set_max_length(g_asset_search, 64);
+  lv_textarea_set_placeholder_text(g_asset_search, "Search IP, MAC, port or software");
+  lv_obj_add_event_cb(g_asset_search, [](lv_event_t*) { refreshReconHostList(); }, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  auto* filter = lv_dropdown_create(screen);
+  lv_obj_set_size(filter, 170, 44);
+  lv_obj_align(filter, LV_ALIGN_TOP_LEFT, kSafeMargin + 322, toolbar_top);
+  lv_dropdown_set_options(filter, "All assets\nNeeds review\nKnown ports\nUnidentified");
+  lv_obj_add_event_cb(filter, [](lv_event_t* e) {
+    g_asset_filter = static_cast<reconclave::AssetFilter>(lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(e))));
+    refreshReconHostList();
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  auto* sort = lv_dropdown_create(screen);
+  lv_obj_set_size(sort, 170, 44);
+  lv_obj_align(sort, LV_ALIGN_TOP_LEFT, kSafeMargin + 504, toolbar_top);
+  lv_dropdown_set_options(sort, "IP address\nRecently seen\nReview first");
+  lv_obj_add_event_cb(sort, [](lv_event_t* e) {
+    g_asset_sort = static_cast<reconclave::AssetSort>(lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(e))));
+    refreshReconHostList();
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  auto* clear = lv_button_create(screen);
+  lv_obj_set_size(clear, 100, 44);
+  lv_obj_align(clear, LV_ALIGN_TOP_RIGHT, -kSafeMargin, toolbar_top);
+  auto* clear_label = lv_label_create(clear); lv_label_set_text(clear_label, "Clear"); lv_obj_center(clear_label);
+  lv_obj_add_event_cb(clear, [](lv_event_t*) { lv_textarea_set_text(g_asset_search, ""); }, LV_EVENT_CLICKED, nullptr);
+  for (auto* control : {filter, sort, clear, g_assets_interface_choice}) {
+    lv_obj_set_style_bg_color(control, lv_color_hex(kColorPanelLight), 0);
+    lv_obj_set_style_border_color(control, lv_color_hex(kColorAccent), 0);
+    lv_obj_set_style_border_width(control, 1, 0);
+    lv_obj_set_style_radius(control, 8, 0);
+    lv_obj_set_style_pad_all(control, 10, 0);
+    lv_obj_set_style_text_font(control, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(control, lv_color_hex(kColorForeground), 0);
+    lv_obj_set_style_shadow_width(control, 0, 0);
+  }
+  for (auto* dropdown : {filter, sort, g_assets_interface_choice}) {
+    auto* list = lv_dropdown_get_list(dropdown);
+    lv_obj_set_style_bg_color(list, lv_color_hex(kColorPanelLight), 0);
+    lv_obj_set_style_text_color(list, lv_color_hex(kColorForeground), 0);
+    lv_obj_set_style_text_font(list, &lv_font_montserrat_14, 0);
+  }
+  g_asset_count = lv_label_create(screen);
+  lv_obj_align(g_asset_count, LV_ALIGN_TOP_LEFT, kSafeMargin, toolbar_top + 50);
+  lv_obj_set_style_text_font(g_asset_count, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(g_asset_count, lv_color_hex(kColorSecondary), 0);
+
   g_recon_host_list = lv_list_create(screen);
-  const lv_coord_t list_top = kContentTop + kSummaryHeight + kGap + kActionStatusHeight + kGap;
-  lv_obj_set_size(g_recon_host_list, contentWidth(screen), contentHeight(screen) - kSummaryHeight -
-                   kActionStatusHeight - 2 * kGap);
+  const lv_coord_t list_top = toolbar_top + 74;
+  lv_obj_set_size(g_recon_host_list, contentWidth(screen), contentHeight(screen) -
+      (list_top - kContentTop));
   lv_obj_align(g_recon_host_list, LV_ALIGN_TOP_MID, 0, list_top);
   lv_obj_set_style_bg_color(g_recon_host_list, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_radius(g_recon_host_list, 10, 0);
+  lv_obj_set_style_pad_all(g_recon_host_list, 8, 0);
+  lv_obj_set_style_pad_row(g_recon_host_list, 6, 0);
   lv_obj_set_style_border_width(g_recon_host_list, 0, 0);
   refreshReconHostList();
 
+  auto* keyboard = lv_keyboard_create(screen);
+  lv_obj_set_size(keyboard, contentWidth(screen), 210);
+  lv_obj_align(keyboard, LV_ALIGN_BOTTOM_MID, 0, -kSafeMargin);
+  lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_bg_color(keyboard, lv_color_hex(kColorPanel), 0);
+  lv_obj_add_event_cb(g_asset_search, [](lv_event_t* e) {
+    auto* kb = static_cast<lv_obj_t*>(lv_event_get_user_data(e));
+    lv_keyboard_set_textarea(kb, g_asset_search);
+    lv_obj_remove_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(kb);
+  }, LV_EVENT_CLICKED, keyboard);
+  lv_obj_add_event_cb(keyboard, [](lv_event_t* e) {
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL)
+      lv_obj_add_flag(static_cast<lv_obj_t*>(lv_event_get_target(e)), LV_OBJ_FLAG_HIDDEN);
+  }, LV_EVENT_ALL, nullptr);
   g_recon_screen = screen;
   return screen;
 }
@@ -2257,10 +2871,32 @@ lv_obj_t* buildReconScreen(lv_obj_t* home) {
 lv_obj_t* buildFindingsScreen(lv_obj_t* home) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
-  addStatusBar(screen, "FINDINGS", true);
+  addStatusBar(screen, "REVIEW", true);
   // Opened only from RECON, so back returns there - not the fixed `home`
   // addBackButton() always uses (see addDynamicBackButton's comment).
   addDynamicBackButton(screen, &g_findings_return, home);
+
+  auto add_tab = [&](const char* title, lv_coord_t x, bool changes) {
+    lv_obj_t* button = lv_button_create(screen);
+    lv_obj_set_size(button, 190, kBackButtonHeight);
+    lv_obj_align(button, LV_ALIGN_TOP_LEFT, x, kSafeMargin + kStatusBarHeight + 8);
+    lv_obj_set_style_border_color(button, lv_color_hex(kColorAccent), 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_add_event_cb(button, [](lv_event_t* event) {
+      g_findings_show_changes = lv_event_get_user_data(event) != nullptr;
+      if (g_findings_list != nullptr) lv_obj_scroll_to_y(g_findings_list, 0, LV_ANIM_OFF);
+      refreshFindingsList();
+    }, LV_EVENT_CLICKED, changes ? screen : nullptr);
+    lv_obj_t* label = lv_label_create(button);
+    lv_label_set_text(label, title);
+    lv_obj_set_style_text_color(label, lv_color_hex(kColorPanel), 0);
+    lv_obj_center(label);
+    return button;
+  };
+  g_findings_service_tab = add_tab("Service notes", kSafeMargin + 110, false);
+  g_findings_changes_tab = add_tab("Device changes", kSafeMargin + 312, true);
 
   g_findings_status = lv_label_create(screen);
   lv_label_set_text(g_findings_status, "0 findings requiring review");
@@ -2285,11 +2921,30 @@ lv_obj_t* buildFindingsScreen(lv_obj_t* home) {
 lv_obj_t* buildHostDetailScreen(lv_obj_t* home) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
-  addStatusBar(screen, "HOST DETAIL", true);
+  addStatusBar(screen, "ASSET", true);
   // Opened from either RECON's host list or Findings - back returns to
   // whichever one it actually was (see attachHostAddress/showHostDetail),
   // falling back to `home` only if none was recorded.
   addDynamicBackButton(screen, &g_host_detail_return, home);
+
+  lv_obj_t* detail_toggle = lv_button_create(screen);
+  lv_obj_set_size(detail_toggle, 190, kBackButtonHeight);
+  lv_obj_align(detail_toggle, LV_ALIGN_TOP_RIGHT, -kSafeMargin - 202,
+               kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(detail_toggle, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(detail_toggle, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(detail_toggle, 1, 0);
+  lv_obj_set_style_radius(detail_toggle, 8, 0);
+  lv_obj_set_style_shadow_width(detail_toggle, 0, 0);
+  lv_obj_add_event_cb(detail_toggle, [](lv_event_t*) {
+    g_host_detail_technical = !g_host_detail_technical;
+    populateHostDetail(g_host_detail_address);
+    if (g_host_detail_card != nullptr) lv_obj_scroll_to_y(g_host_detail_card, 0, LV_ANIM_OFF);
+  }, LV_EVENT_CLICKED, nullptr);
+  g_host_detail_toggle_label = lv_label_create(detail_toggle);
+  lv_label_set_text(g_host_detail_toggle_label, "Technical details");
+  lv_obj_set_style_text_color(g_host_detail_toggle_label, lv_color_hex(kColorForeground), 0);
+  lv_obj_center(g_host_detail_toggle_label);
 
   g_host_detail_recheck_button = lv_button_create(screen);
   lv_obj_set_size(g_host_detail_recheck_button, 190, kBackButtonHeight);
@@ -2335,6 +2990,7 @@ lv_obj_t* buildHostDetailScreen(lv_obj_t* home) {
   lv_obj_align(g_host_detail_title, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
 
   lv_obj_t* card = lv_obj_create(screen);
+  g_host_detail_card = card;
   lv_obj_set_size(card, contentWidth(screen), contentHeight(screen) - 44 - 30);
   lv_obj_align(card, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + 44);
   lv_obj_set_style_bg_color(card, lv_color_hex(kColorPanelLight), 0);
@@ -2681,6 +3337,8 @@ lv_obj_t* buildAssessmentScreen(lv_obj_t* home) {
     fields[i] = lv_textarea_create(screen);
     lv_obj_set_size(fields[i], field_width, 64);
     lv_obj_align(fields[i], LV_ALIGN_TOP_LEFT, kSafeMargin + i * (field_width + 16), kContentTop + 28);
+    lv_obj_set_style_pad_all(fields[i], 12, 0);
+    lv_textarea_set_placeholder_text(fields[i], i == 2 ? "Your name or ID" : "Enter an identifier");
     lv_textarea_set_one_line(fields[i], true);
     lv_textarea_set_max_length(fields[i], 48);
     lv_textarea_set_text(fields[i], values[i]->c_str());
@@ -2704,11 +3362,23 @@ lv_obj_t* buildAssessmentScreen(lv_obj_t* home) {
   auto* session_fields = new SessionFields{fields[0], fields[1], fields[2]};
   lv_obj_add_event_cb(save_button, [](lv_event_t* event) {
     auto* entry = static_cast<SessionFields*>(lv_event_get_user_data(event));
+    const auto previous_project = g_project_id;
+    const auto previous_engagement = g_engagement_id;
+    const auto previous_operator = g_operator_id;
     g_project_id = safeSessionValue(lv_textarea_get_text(entry->project), "UNASSIGNED");
     g_engagement_id = safeSessionValue(lv_textarea_get_text(entry->engagement), "UNASSIGNED");
     g_operator_id = safeSessionValue(lv_textarea_get_text(entry->operator_id), "LOCAL");
-    lv_label_set_text(g_session_status, saveSession() ? "Session saved; new evidence will carry this context"
-                                                      : "Unable to save session");
+    if (saveSession()) {
+      lv_textarea_set_text(entry->project, g_project_id.c_str());
+      lv_textarea_set_text(entry->engagement, g_engagement_id.c_str());
+      lv_textarea_set_text(entry->operator_id, g_operator_id.c_str());
+      lv_label_set_text(g_session_status, "Session saved. New evidence will use these details.");
+    } else {
+      g_project_id = previous_project;
+      g_engagement_id = previous_engagement;
+      g_operator_id = previous_operator;
+      lv_label_set_text(g_session_status, "Could not save. Check available storage, then tap Save to retry.");
+    }
   }, LV_EVENT_CLICKED, session_fields);
   lv_obj_t* save_label = lv_label_create(save_button);
   lv_label_set_text(save_label, LV_SYMBOL_SAVE " Save");
@@ -2716,9 +3386,7 @@ lv_obj_t* buildAssessmentScreen(lv_obj_t* home) {
   lv_obj_center(save_label);
 
   lv_obj_t* activity = lv_obj_create(screen);
-  // Vendor textarea styling enforces a taller rendered box than the nominal
-  // object height. Keep the activity panel below that real 112 px footprint.
-  constexpr lv_coord_t kFieldsFootprint = 150;
+  constexpr lv_coord_t kFieldsFootprint = 104;
   const lv_coord_t activity_top = kContentTop + kFieldsFootprint;
   const lv_coord_t activity_height = contentHeight(screen) - kFieldsFootprint -
                                      (keyboard != nullptr ? 212 : 0);
@@ -2728,10 +3396,11 @@ lv_obj_t* buildAssessmentScreen(lv_obj_t* home) {
   lv_obj_set_style_border_color(activity, lv_color_hex(kColorAccent), 0);
   lv_obj_set_style_border_width(activity, 1, 0);
   lv_obj_set_style_radius(activity, 10, 0);
-  lv_obj_set_style_pad_all(activity, 18, 0);
+  lv_obj_set_style_pad_all(activity, keyboard != nullptr ? 6 : 18, 0);
   lv_obj_clear_flag(activity, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t* activity_heading = lv_label_create(activity);
-  lv_label_set_text(activity_heading, "ASSESSMENT CONTEXT  //  EVIDENCE ATTRIBUTION");
+  lv_label_set_text(activity_heading, "Evidence will use this session after you save.");
+  if (keyboard != nullptr) lv_obj_add_flag(activity_heading, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_style_text_color(activity_heading, lv_color_hex(kColorAccent), 0);
   lv_obj_set_style_text_font(activity_heading, &lv_font_montserrat_12, 0);
   lv_obj_align(activity_heading, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -2740,12 +3409,17 @@ lv_obj_t* buildAssessmentScreen(lv_obj_t* home) {
   lv_label_set_text(g_session_status, g_keyboard_ready
       ? "HARDWARE KEYBOARD READY\n\nSelect a field, enter the engagement context, then tap Save.\n"
         "New evidence artifacts will inherit these identifiers."
-      : "TOUCH INPUT READY\n\nSet field context before collecting assessment evidence.");
+      : "Enter session details, then tap Save.");
   lv_obj_set_style_text_color(g_session_status, lv_color_hex(kColorSecondary), 0);
   lv_obj_set_style_text_font(g_session_status, &lv_font_montserrat_14, 0);
   lv_obj_set_width(g_session_status, lv_pct(100));
   lv_label_set_long_mode(g_session_status, LV_LABEL_LONG_MODE_WRAP);
-  lv_obj_align(g_session_status, LV_ALIGN_TOP_LEFT, 0, 34);
+  lv_obj_align(g_session_status, LV_ALIGN_TOP_LEFT, 0, keyboard != nullptr ? 0 : 34);
+  for (auto* field : fields) {
+    lv_obj_add_event_cb(field, [](lv_event_t*) {
+      lv_label_set_text(g_session_status, "Unsaved changes. Tap Save to use these session details.");
+    }, LV_EVENT_VALUE_CHANGED, nullptr);
+  }
   return screen;
 }
 
@@ -2790,6 +3464,7 @@ lv_obj_t* buildWirelessScreen(lv_obj_t* home) {
   // Same row as the back button, right-aligned, rather than overlapping
   // the status bar above it.
   lv_obj_t* scan_button = lv_button_create(screen);
+  g_wifi_scan_button = scan_button;
   lv_obj_set_size(scan_button, 110, kBackButtonHeight);
   lv_obj_align(scan_button, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kSafeMargin + kStatusBarHeight + 8);
   lv_obj_set_style_bg_color(scan_button, lv_color_hex(kColorPanelLight), 0);
@@ -2806,17 +3481,386 @@ lv_obj_t* buildWirelessScreen(lv_obj_t* home) {
 
   g_wifi_status = lv_label_create(screen);
   lv_label_set_text(g_wifi_status, "Tap Scan to discover nearby networks");
+  lv_obj_set_width(g_wifi_status, contentWidth(screen));
+  lv_label_set_long_mode(g_wifi_status, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_style_text_color(g_wifi_status, lv_color_hex(kColorSecondary), 0);
   lv_obj_set_style_text_font(g_wifi_status, &lv_font_montserrat_16, 0);
   lv_obj_align(g_wifi_status, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
 
   g_wifi_list = lv_list_create(screen);
-  lv_obj_set_size(g_wifi_list, contentWidth(screen), contentHeight(screen) - 28);
-  lv_obj_align(g_wifi_list, LV_ALIGN_TOP_MID, 0, kContentTop + 28);
+  lv_obj_set_size(g_wifi_list, contentWidth(screen), contentHeight(screen) - 52);
+  lv_obj_align(g_wifi_list, LV_ALIGN_TOP_MID, 0, kContentTop + 52);
   lv_obj_set_style_bg_color(g_wifi_list, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_radius(g_wifi_list, 10, 0);
   lv_obj_set_style_border_width(g_wifi_list, 0, 0);
 
+  return screen;
+}
+
+void cancelTrackedJob(UiJob job) {
+  if (!g_jobs.get(job).active()) return;
+  if (job == UiJob::Capture && g_capture_pid > 0) {
+    g_jobs.cancelling(job); kill(g_capture_pid, SIGTERM);
+  } else if (job == UiJob::Nmap) {
+    if (g_nmap_pid > 0) {
+      g_jobs.cancelling(job); kill(g_nmap_pid, SIGTERM);
+    } else if (!g_mission_seen_id.empty()) {
+      const pid_t child = fork();
+      if (child == 0) {
+        execlp("reconclave-mission", "reconclave-mission", "stop", static_cast<char*>(nullptr));
+        _exit(127);
+      }
+      if (child > 0) {
+        g_jobs.cancelling(job);
+        int status = 0;
+        waitpid(child, &status, 0);
+      }
+    }
+  } else if (job == UiJob::Evidence && g_evidence_busy && g_evidence_cancellable) {
+    g_jobs.cancelling(job); g_evidence_cancel_requested.store(true);
+  }
+}
+
+void refreshJobs(lv_timer_t*) {
+  if (!g_jobs_summary) return;
+  reconclave::json::Value mission;
+  std::string mission_error;
+  if (reconclave::json::parse(readTextFile("/root/reconclave/mission/state.json"), mission, mission_error)) {
+    const auto* id_value = mission.find("id");
+    const auto* state_value = mission.find("state");
+    const auto* scope_value = mission.find("scope");
+    const auto* iface_value = mission.find("interface");
+    const auto* stage_value = mission.find("stage");
+    const auto* summary_value = mission.find("summary");
+    const auto* metrics_value = mission.find("metrics");
+    const auto* reason_value = mission.find("stop_reason");
+    const auto* message_value = mission.find("message");
+    const auto* warning_value = mission.find("warning_count");
+    const auto* profile_value = mission.find("profile");
+    const auto* checkpoint_value = mission.find("checkpoint");
+    const auto* field_report_value = mission.find("field_report");
+    const std::string id = id_value ? id_value->asString() : "";
+    const std::string state = state_value ? state_value->asString() : "";
+    const std::string scope = scope_value ? scope_value->asString() : "";
+    const std::string iface = iface_value ? iface_value->asString() : "";
+    const std::string stage = stage_value ? stage_value->asString() : "";
+    const std::string profile = profile_value ? profile_value->asString() : "balanced";
+    const bool active = state == "starting" || state == "running" || state == "stopping";
+    if (g_nmap_resume_button) {
+      const bool resumable = (state == "stopped" || state == "partial" || state == "interrupted") &&
+          checkpoint_value && !checkpoint_value->asString().empty();
+      if (resumable) lv_obj_remove_state(g_nmap_resume_button, LV_STATE_DISABLED);
+      else lv_obj_add_state(g_nmap_resume_button, LV_STATE_DISABLED);
+    }
+    if (!id.empty() && g_nmap_pid <= 0) {
+      const bool changed = id != g_mission_seen_id || state != g_mission_seen_state ||
+                           (active && stage != g_mission_seen_stage);
+      if (g_mission_seen_id != id) {
+        g_mission_seen_id = id;
+        g_jobs.begin(UiJob::Nmap, "Assessment / " + scope + " / " + iface);
+      }
+      if (!active && g_jobs.get(UiJob::Nmap).active())
+        g_jobs.finish(UiJob::Nmap, state == "complete", stage, state == "stopped");
+      if (active) g_jobs.progress(UiJob::Nmap, "Assessment / " + scope + " / " + profile + " / " + stage);
+      if (changed && g_nmap_output) {
+        std::string coverage;
+        if (metrics_value) {
+          const auto number = [metrics_value](const char* key) {
+            const auto* value = metrics_value->find(key);
+            return value ? std::to_string(value->asUInt64()) : std::string("?");
+          };
+          coverage = "\n\nRESULTS\nResponding hosts: " + number("responding_hosts") +
+              "  /  Hosts with open TCP: " + number("hosts_with_open_tcp") +
+              "\nService ports checked: " + number("service_ports_checked") +
+              "  /  Skipped: " + number("service_ports_skipped") +
+              "\nProtocol checks: " + number("protocol_checks") +
+              "  /  NSE hosts: " + number("nse_hosts_checked") +
+              "\nFull TCP hosts: " + number("deep_hosts_checked") +
+              "  /  Skipped: " + number("deep_hosts_skipped");
+          if (warning_value) coverage += "\nWarnings: " + std::to_string(warning_value->asUInt64());
+        }
+        const std::string stage_display = (!active && stage.rfind("ASSESSMENT ", 0) == 0)
+            ? std::string("Finished: ") + state
+            : std::string("Stage: ") + stage.substr(0, 100);
+        const std::string message = "ASSESSMENT " + state + "\nScope: " + scope + "\nInterface: " + iface +
+            "  /  Profile: " + profile +
+            "\n" + stage_display + (reason_value && !reason_value->asString().empty()
+            ? "\nStopped because: " + reason_value->asString() : "") + coverage +
+            (message_value && !message_value->asString().empty()
+            ? "\nWorker error: " + message_value->asString() : "") +
+            (summary_value && !summary_value->asString().empty()
+            ? "\nReport: " + summary_value->asString() : "") +
+            (field_report_value && !field_report_value->asString().empty()
+            ? "\nDesktop handoff: JSON + Markdown + CSV in Evidence" : "") +
+            (active ? "\n\nThe job continues if this screen or UI closes. Open Jobs to stop it."
+                    : "\n\nOpen Evidence for the full report and coverage limits.");
+        lv_label_set_text(g_nmap_output, message.c_str());
+        g_mission_seen_state = state;
+        g_mission_seen_stage = stage;
+      }
+    }
+  }
+  const auto count = g_jobs.activeCount();
+  std::ofstream runtime("/run/reconclave/ui-jobs.tmp");
+  const char* names[] = {"wifi", "evidence", "capture", "nmap", "screenshot"};
+  for (unsigned i = 0; i < 5; ++i) {
+    const auto& record = g_jobs.get(static_cast<UiJob>(i));
+    runtime << names[i] << " " << reconclave::uiJobStateName(record.state) << " " << record.elapsedSeconds() << "s\n";
+  }
+  runtime.close();
+  if (runtime.good()) std::rename("/run/reconclave/ui-jobs.tmp", "/run/reconclave/ui-jobs");
+  const std::string summary = std::to_string(count) +
+      " local operations running  /  Assessment state survives UI restart";
+  lv_label_set_text(g_jobs_summary, summary.c_str());
+  if (g_home_jobs) lv_label_set_text(g_home_jobs, (LV_SYMBOL_LIST " Jobs: " + std::to_string(count) + " running").c_str());
+  const char* titles[] = {"Wi-Fi", "Evidence", "Packet capture", "Network scan", "Screenshot"};
+  for (unsigned i = 0; i < 5; ++i) {
+    const auto kind = static_cast<UiJob>(i);
+    const auto& record = g_jobs.get(kind);
+    std::string detail = record.detail;
+    if (kind == UiJob::Evidence && record.active()) {
+      std::lock_guard<std::mutex> lock(g_evidence_message_mutex);
+      detail = g_evidence_message;
+    }
+    std::replace(detail.begin(), detail.end(), '\n', ' ');
+    const std::string text = std::string(titles[i]) + "  /  " + reconclave::uiJobStateName(record.state) +
+        "  /  " + std::to_string(record.elapsedSeconds()) + "s\n" + detail.substr(0, 130);
+    lv_label_set_text(g_jobs_rows[i], text.c_str());
+    const bool can_cancel = record.active() && record.state != reconclave::UiJobState::Cancelling &&
+        (kind == UiJob::Capture || kind == UiJob::Nmap || (kind == UiJob::Evidence && g_evidence_cancellable));
+    if (can_cancel) lv_obj_remove_state(g_jobs_cancel[i], LV_STATE_DISABLED);
+    else lv_obj_add_state(g_jobs_cancel[i], LV_STATE_DISABLED);
+  }
+  const std::string node = readTextFile("/run/reconclave/node-status");
+  const std::string remote = node.empty() ? "Remote node: no status available" :
+      "Remote discovery: " + nodeStatusValue(node, "JOB STATUS") + "  /  " + nodeStatusValue(node, "PROGRESS");
+  const std::string sensors = remote + "\nGNSS: " + (g_gnss.running() ? "running" : "off") +
+      "  /  Camera preview: " + (g_preview_worker_running.load() ? "running" : "off");
+  lv_label_set_text(g_jobs_remote, sensors.c_str());
+}
+
+lv_obj_t* buildJobsScreen(lv_obj_t* home) {
+  using namespace reconclave::ui;
+  auto* screen = createScreen();
+  addStatusBar(screen, "JOBS & ACTIVITY", false);
+  addBackButton(screen, home);
+  g_jobs_summary = lv_label_create(screen);
+  lv_obj_set_pos(g_jobs_summary, kSafeMargin + 112, kSafeMargin + kStatusBarHeight + 20);
+  lv_obj_set_style_text_color(g_jobs_summary, lv_color_hex(kColorSecondary), 0);
+  auto* list = lv_obj_create(screen);
+  lv_obj_set_size(list, contentWidth(screen), contentHeight(screen));
+  lv_obj_set_pos(list, kSafeMargin, kContentTop);
+  lv_obj_set_style_pad_all(list, 4, 0);
+  lv_obj_set_style_pad_right(list, 14, 0);
+  lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
+  lv_obj_set_style_pad_row(list, 10, 0);
+  lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(list, 0, 0);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  const char* targets[] = {"wifi-survey", "evidence", "packet", "nmap", "evidence"};
+  for (unsigned i = 0; i < 5; ++i) {
+    auto* row = lv_obj_create(list);
+    lv_obj_set_size(row, lv_pct(100), 90);
+    lv_obj_set_style_pad_all(row, 12, 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(kColorPanelLight), 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_radius(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    g_jobs_rows[i] = lv_label_create(row);
+    lv_obj_set_width(g_jobs_rows[i], contentWidth(screen) - 310);
+    lv_label_set_long_mode(g_jobs_rows[i], LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(g_jobs_rows[i], &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(g_jobs_rows[i], lv_color_hex(kColorForeground), 0);
+    lv_obj_align(g_jobs_rows[i], LV_ALIGN_LEFT_MID, 0, 0);
+    auto* open = lv_button_create(row);
+    lv_obj_set_size(open, 100, 44);
+    lv_obj_align(open, LV_ALIGN_RIGHT_MID, -116, 0);
+    lv_obj_set_style_bg_color(open, lv_color_hex(kColorPanel), 0);
+    lv_obj_set_style_radius(open, 8, 0);
+    lv_obj_set_style_shadow_width(open, 0, 0);
+    auto* label = lv_label_create(open);
+    lv_label_set_text(label, "Open");
+    lv_obj_set_style_text_color(label, lv_color_hex(kColorAccent), 0);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(open, [](lv_event_t* event) {
+      const auto* target = static_cast<const char*>(lv_event_get_user_data(event));
+      for (const auto& item : g_ui_screens) if (item.first == target) navigateToScreen(item.second);
+    }, LV_EVENT_CLICKED, const_cast<char*>(targets[i]));
+    g_jobs_cancel[i] = lv_button_create(row);
+    lv_obj_set_size(g_jobs_cancel[i], 100, 44);
+    lv_obj_align(g_jobs_cancel[i], LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(g_jobs_cancel[i], lv_color_hex(kColorPanel), 0);
+    lv_obj_set_style_radius(g_jobs_cancel[i], 8, 0);
+    lv_obj_set_style_shadow_width(g_jobs_cancel[i], 0, 0);
+    lv_obj_set_style_opa(g_jobs_cancel[i], LV_OPA_40, LV_STATE_DISABLED);
+    label = lv_label_create(g_jobs_cancel[i]);
+    lv_label_set_text(label, "Stop");
+    lv_obj_set_style_text_color(label, lv_color_hex(kColorAmber), 0);
+    lv_obj_center(label);
+    auto* kind = new UiJob(static_cast<UiJob>(i));
+    lv_obj_add_event_cb(g_jobs_cancel[i], [](lv_event_t* event) {
+      cancelTrackedJob(*static_cast<UiJob*>(lv_event_get_user_data(event)));
+      refreshJobs(nullptr);
+    }, LV_EVENT_CLICKED, kind);
+    lv_obj_add_event_cb(g_jobs_cancel[i], [](lv_event_t* event) {
+      delete static_cast<UiJob*>(lv_event_get_user_data(event));
+    }, LV_EVENT_DELETE, kind);
+  }
+  g_jobs_remote = lv_label_create(list);
+  lv_obj_set_style_text_color(g_jobs_remote, lv_color_hex(kColorSecondary), 0);
+  lv_obj_set_width(g_jobs_remote, lv_pct(100));
+  lv_label_set_long_mode(g_jobs_remote, LV_LABEL_LONG_MODE_WRAP);
+  g_jobs_screen = screen;
+  refreshJobs(nullptr);
+  return screen;
+}
+
+bool evidenceMatchesFilter(const std::string& name, unsigned filter) {
+  std::string lower = name;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+  const auto dot = lower.rfind('.');
+  const std::string extension = dot == std::string::npos ? "" : lower.substr(dot);
+  const bool photo = extension == ".jpg" || extension == ".jpeg" || extension == ".png";
+  const bool capture = extension == ".pcap" || extension == ".pcapng";
+  const bool text = extension == ".csv" || extension == ".json" || extension == ".jsonl" || extension == ".md" ||
+                    extension == ".txt" || extension == ".log";
+  return filter == 0 || (filter == 1 && photo) || (filter == 2 && capture) ||
+         (filter == 3 && text) || (filter == 4 && !photo && !capture && !text);
+}
+
+void refreshEvidenceBrowser() {
+  if (!g_evidence_list) return;
+  std::string error;
+  const bool ok = reconclave::listEvidenceFiles(kEvidenceDir, g_evidence_files, error);
+  const unsigned filter = lv_dropdown_get_selected(g_evidence_filter);
+  std::vector<reconclave::EvidenceFile> visible;
+  for (const auto& file : g_evidence_files)
+    if (filter == 5 ? (file.attributed && reconclave::sameEvidenceContext(file.context, currentContext()))
+                    : evidenceMatchesFilter(file.name, filter)) visible.push_back(file);
+  constexpr std::size_t page_size = 6;
+  if (g_evidence_offset >= visible.size()) g_evidence_offset = 0;
+  lv_obj_clean(g_evidence_list);
+  lv_obj_add_state(g_evidence_previous, LV_STATE_DISABLED);
+  lv_obj_add_state(g_evidence_next, LV_STATE_DISABLED);
+  if (g_evidence_offset > 0) lv_obj_remove_state(g_evidence_previous, LV_STATE_DISABLED);
+  if (g_evidence_offset + page_size < visible.size()) lv_obj_remove_state(g_evidence_next, LV_STATE_DISABLED);
+  const std::string page = visible.empty() ? "No files" :
+      std::to_string(g_evidence_offset + 1) + "-" +
+      std::to_string(std::min(g_evidence_offset + page_size, visible.size())) + " of " + std::to_string(visible.size());
+  lv_label_set_text(g_evidence_page, page.c_str());
+  lv_label_set_text(g_evidence_preview, !ok ? ("Unable to list evidence: " + error).c_str() :
+      visible.empty() ? "No files match this filter. Save an observation or choose All files." :
+      "Select a file to inspect its details.\n\nText previews show up to 8 KiB.\n"
+      "Photos and packet captures can be inspected on your computer after exporting the store.\n\n"
+      "Exports are saved under /root/reconclave/evidence/exports/. Original files are kept.");
+  for (std::size_t i = g_evidence_offset; i < std::min(g_evidence_offset + page_size, visible.size()); ++i) {
+    auto* row = makeListRow(g_evidence_list, reconclave::ui::kColorUnavailable, 54);
+    auto* name = lv_label_create(row);
+    lv_label_set_text(name, visible[i].name.c_str());
+    lv_obj_set_width(name, lv_pct(100));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(reconclave::ui::kColorForeground), 0);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, -3);
+    auto* detail = lv_label_create(row);
+    const std::string metadata = formatBytes(visible[i].size) + "  /  " +
+        formatEpochMs(static_cast<std::uint64_t>(std::max<std::int64_t>(0, visible[i].modified)) * 1000);
+    lv_label_set_text(detail, metadata.c_str());
+    lv_obj_set_style_text_font(detail, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(detail, lv_color_hex(reconclave::ui::kColorSecondary), 0);
+    lv_obj_align(detail, LV_ALIGN_BOTTOM_LEFT, 0, 3);
+    auto* file = new reconclave::EvidenceFile(visible[i]);
+    lv_obj_add_event_cb(row, [](lv_event_t* event) {
+      auto* file = static_cast<reconclave::EvidenceFile*>(lv_event_get_user_data(event));
+      std::string preview, error;
+      const bool ok = reconclave::previewEvidenceFile(kEvidenceDir, file->name, preview, error);
+      const std::string attribution = file->attributed ?
+          "Project: " + file->context.project_id + "\nEngagement: " + file->context.engagement_id +
+          "\nOperator: " + file->context.operator_id : "Session: unknown (legacy or externally created file)";
+      const std::string text = file->name + "\n" + formatBytes(file->size) + "\n" + attribution + "\n\n" + (ok ? preview : error);
+      lv_label_set_text(g_evidence_preview, text.c_str());
+      lv_obj_scroll_to_y(lv_obj_get_parent(g_evidence_preview), 0, LV_ANIM_OFF);
+    }, LV_EVENT_CLICKED, file);
+    lv_obj_add_event_cb(row, [](lv_event_t* event) {
+      delete static_cast<reconclave::EvidenceFile*>(lv_event_get_user_data(event));
+    }, LV_EVENT_DELETE, file);
+  }
+}
+
+lv_obj_t* buildEvidenceBrowser(lv_obj_t* home) {
+  using namespace reconclave::ui;
+  auto* screen = createScreen();
+  addStatusBar(screen, "EVIDENCE / FILES", false);
+  addBackButton(screen, home);
+  const lv_coord_t controls_y = kSafeMargin + kStatusBarHeight + 8;
+  g_evidence_filter = lv_dropdown_create(screen);
+  lv_dropdown_set_options(g_evidence_filter, "All files\nPhotos\nPacket captures\nText & reports\nOther files\nCurrent session");
+  lv_obj_set_size(g_evidence_filter, 220, kBackButtonHeight);
+  lv_obj_set_pos(g_evidence_filter, kSafeMargin + 112, controls_y);
+  lv_obj_set_style_bg_color(g_evidence_filter, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_width(g_evidence_filter, 1, 0);
+  lv_obj_set_style_border_color(g_evidence_filter, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_radius(g_evidence_filter, 8, 0);
+  lv_obj_set_style_pad_all(g_evidence_filter, 8, 0);
+  lv_obj_set_style_shadow_width(g_evidence_filter, 0, 0);
+  lv_obj_set_style_text_color(g_evidence_filter, lv_color_hex(kColorForeground), 0);
+  auto* filter_list = lv_dropdown_get_list(g_evidence_filter);
+  lv_obj_set_style_bg_color(filter_list, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_text_color(filter_list, lv_color_hex(kColorForeground), 0);
+  lv_obj_add_event_cb(g_evidence_filter, [](lv_event_t*) {
+    g_evidence_offset = 0; refreshEvidenceBrowser();
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  auto* refresh = lv_button_create(screen);
+  g_evidence_previous = lv_button_create(screen);
+  g_evidence_next = lv_button_create(screen);
+  lv_obj_t* buttons[] = {refresh, g_evidence_previous, g_evidence_next};
+  const char* labels[] = {"Refresh", "Previous", "Next"};
+  for (int i = 0; i < 3; ++i) {
+    lv_obj_set_size(buttons[i], 110, kBackButtonHeight);
+    lv_obj_align(buttons[i], LV_ALIGN_TOP_RIGHT, -kSafeMargin - (2 - i) * 120, controls_y);
+    lv_obj_set_style_bg_color(buttons[i], lv_color_hex(kColorPanelLight), 0);
+    lv_obj_set_style_opa(buttons[i], LV_OPA_40, LV_STATE_DISABLED);
+    lv_obj_set_style_shadow_width(buttons[i], 0, 0);
+    lv_obj_set_style_radius(buttons[i], 8, 0);
+    auto* label = lv_label_create(buttons[i]);
+    lv_label_set_text(label, labels[i]);
+    lv_obj_set_style_text_color(label, lv_color_hex(kColorAccent), 0);
+    lv_obj_center(label);
+  }
+  lv_obj_add_event_cb(refresh, [](lv_event_t*) { refreshEvidenceBrowser(); }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(g_evidence_previous, [](lv_event_t*) {
+    if (g_evidence_offset >= 6) g_evidence_offset -= 6;
+    refreshEvidenceBrowser();
+  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(g_evidence_next, [](lv_event_t*) { g_evidence_offset += 6; refreshEvidenceBrowser(); }, LV_EVENT_CLICKED, nullptr);
+  g_evidence_page = lv_label_create(screen);
+  lv_obj_set_pos(g_evidence_page, kSafeMargin + 350, controls_y + 12);
+  lv_obj_set_style_text_color(g_evidence_page, lv_color_hex(kColorSecondary), 0);
+  const lv_coord_t list_width = contentWidth(screen) * 45 / 100;
+  g_evidence_list = lv_obj_create(screen);
+  lv_obj_set_size(g_evidence_list, list_width, contentHeight(screen));
+  lv_obj_set_pos(g_evidence_list, kSafeMargin, kContentTop);
+  lv_obj_set_style_bg_opa(g_evidence_list, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(g_evidence_list, 0, 0);
+  lv_obj_set_style_pad_all(g_evidence_list, 4, 0);
+  lv_obj_set_style_pad_row(g_evidence_list, 8, 0);
+  lv_obj_set_flex_flow(g_evidence_list, LV_FLEX_FLOW_COLUMN);
+  auto* preview = lv_obj_create(screen);
+  lv_obj_set_size(preview, contentWidth(screen) - list_width - 16, contentHeight(screen));
+  lv_obj_align(preview, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kContentTop);
+  lv_obj_set_style_bg_color(preview, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_width(preview, 0, 0);
+  lv_obj_set_style_radius(preview, 12, 0);
+  lv_obj_set_style_pad_all(preview, 16, 0);
+  lv_obj_set_scroll_dir(preview, LV_DIR_VER);
+  g_evidence_preview = lv_label_create(preview);
+  lv_obj_set_width(g_evidence_preview, lv_pct(100));
+  lv_label_set_long_mode(g_evidence_preview, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_set_style_text_font(g_evidence_preview, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(g_evidence_preview, lv_color_hex(kColorForeground), 0);
+  g_evidence_browser = screen;
+  lv_obj_add_event_cb(screen, [](lv_event_t*) { refreshEvidenceBrowser(); }, LV_EVENT_SCREEN_LOADED, nullptr);
+  refreshEvidenceBrowser();
   return screen;
 }
 
@@ -2825,6 +3869,19 @@ lv_obj_t* buildEvidenceScreen(lv_obj_t* home) {
   lv_obj_t* screen = createScreen();
   addStatusBar(screen, "EVIDENCE", true);
   addBackButton(screen, home);
+
+  g_evidence_session_export = lv_button_create(screen);
+  lv_obj_set_size(g_evidence_session_export, 230, kBackButtonHeight);
+  lv_obj_set_pos(g_evidence_session_export, kSafeMargin + 112, kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(g_evidence_session_export, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_shadow_width(g_evidence_session_export, 0, 0);
+  lv_obj_set_style_radius(g_evidence_session_export, 8, 0);
+  lv_obj_set_style_opa(g_evidence_session_export, LV_OPA_40, LV_STATE_DISABLED);
+  auto* session_export_label = lv_label_create(g_evidence_session_export);
+  lv_label_set_text(session_export_label, "Export current session");
+  lv_obj_set_style_text_color(session_export_label, lv_color_hex(kColorAccent), 0);
+  lv_obj_center(session_export_label);
+  lv_obj_add_event_cb(g_evidence_session_export, [](lv_event_t*) { exportEvidenceStore(true); }, LV_EVENT_CLICKED, nullptr);
 
   constexpr lv_coord_t kRailWidth = 280;
   constexpr lv_coord_t kGap = 16;
@@ -2844,6 +3901,7 @@ lv_obj_t* buildEvidenceScreen(lv_obj_t* home) {
   lv_obj_center(export_label);
 
   lv_obj_t* manifest_button = lv_button_create(screen);
+  g_evidence_manifest = manifest_button;
   lv_obj_set_size(manifest_button, kRailWidth, 56);
   lv_obj_align_to(manifest_button, export_button, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
   lv_obj_set_style_bg_color(manifest_button, lv_color_hex(kColorPanelLight), 0);
@@ -2874,6 +3932,55 @@ lv_obj_t* buildEvidenceScreen(lv_obj_t* home) {
   lv_obj_set_style_text_color(screenshot_label, lv_color_hex(kColorAccent), 0);
   lv_obj_center(screenshot_label);
 
+  lv_obj_t* browse = lv_button_create(screen);
+  lv_obj_set_size(browse, kRailWidth, 56);
+  lv_obj_align_to(browse, screenshot_button, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
+  lv_obj_set_style_bg_color(browse, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_radius(browse, 10, 0);
+  lv_obj_set_style_shadow_width(browse, 0, 0);
+  lv_obj_add_event_cb(browse, [](lv_event_t*) {
+    g_evidence_offset = 0;
+    refreshEvidenceBrowser();
+    navigateToScreen(g_evidence_browser);
+  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* browse_label = lv_label_create(browse);
+  lv_label_set_text(browse_label, LV_SYMBOL_DIRECTORY " Browse files");
+  lv_obj_set_style_text_color(browse_label, lv_color_hex(kColorAccent), 0);
+  lv_obj_center(browse_label);
+
+  g_evidence_export = lv_button_create(screen);
+  lv_obj_set_size(g_evidence_export, kRailWidth, 56);
+  lv_obj_align_to(g_evidence_export, browse, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
+  lv_obj_set_style_bg_color(g_evidence_export, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_radius(g_evidence_export, 10, 0);
+  lv_obj_set_style_shadow_width(g_evidence_export, 0, 0);
+  lv_obj_add_event_cb(g_evidence_export, [](lv_event_t*) { exportEvidenceStore(); }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* bundle_label = lv_label_create(g_evidence_export);
+  lv_label_set_text(bundle_label, LV_SYMBOL_DOWNLOAD " Export entire store");
+  lv_obj_set_style_text_color(bundle_label, lv_color_hex(kColorPanel), 0);
+  lv_obj_center(bundle_label);
+
+  g_evidence_cancel = lv_button_create(screen);
+  lv_obj_set_size(g_evidence_cancel, 150, kBackButtonHeight);
+  lv_obj_align(g_evidence_cancel, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kSafeMargin + kStatusBarHeight + 8);
+  lv_obj_set_style_bg_color(g_evidence_cancel, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_shadow_width(g_evidence_cancel, 0, 0);
+  lv_obj_set_style_radius(g_evidence_cancel, 8, 0);
+  lv_obj_add_state(g_evidence_cancel, LV_STATE_DISABLED);
+  lv_obj_set_style_opa(g_evidence_cancel, LV_OPA_40, LV_STATE_DISABLED);
+  lv_obj_set_style_opa(g_evidence_export, LV_OPA_40, LV_STATE_DISABLED);
+  lv_obj_set_style_opa(g_evidence_manifest, LV_OPA_40, LV_STATE_DISABLED);
+  lv_obj_add_event_cb(g_evidence_cancel, [](lv_event_t*) {
+    g_jobs.cancelling(UiJob::Evidence);
+    g_evidence_cancel_requested.store(true);
+    lv_obj_add_state(g_evidence_cancel, LV_STATE_DISABLED);
+    setEvidenceProgress("Cancelling export after the current file...");
+  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cancel_label = lv_label_create(g_evidence_cancel);
+  lv_label_set_text(cancel_label, "Cancel export");
+  lv_obj_set_style_text_color(cancel_label, lv_color_hex(kColorAmber), 0);
+  lv_obj_center(cancel_label);
+
   lv_obj_t* summary_card = lv_obj_create(screen);
   lv_obj_set_size(summary_card, contentWidth(screen) - kRailWidth - kGap, contentHeight(screen));
   lv_obj_align(summary_card, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kContentTop);
@@ -2891,14 +3998,22 @@ lv_obj_t* buildEvidenceScreen(lv_obj_t* home) {
   lv_label_set_long_mode(g_evidence_summary, LV_LABEL_LONG_MODE_WRAP);
   refreshEvidenceSummary();
 
-  g_evidence_status = lv_label_create(screen);
+  auto* status_area = lv_obj_create(screen);
+  lv_obj_set_size(status_area, kRailWidth, contentHeight(screen) - 332);
+  lv_obj_set_pos(status_area, kSafeMargin, kContentTop + 332);
+  lv_obj_set_style_bg_opa(status_area, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(status_area, 0, 0);
+  lv_obj_set_style_pad_all(status_area, 0, 0);
+  lv_obj_set_scroll_dir(status_area, LV_DIR_VER);
+  g_evidence_status = lv_label_create(status_area);
   lv_label_set_text(g_evidence_status, "READY  //  Select an evidence action");
   lv_obj_set_style_text_color(g_evidence_status, lv_color_hex(kColorSecondary), 0);
   lv_obj_set_style_text_font(g_evidence_status, &lv_font_montserrat_14, 0);
   lv_obj_set_width(g_evidence_status, kRailWidth);
   lv_label_set_long_mode(g_evidence_status, LV_LABEL_LONG_MODE_WRAP);
-  lv_obj_align(g_evidence_status, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + 208);
+  lv_obj_align(g_evidence_status, LV_ALIGN_TOP_LEFT, 0, 0);
 
+  lv_obj_add_event_cb(screen, [](lv_event_t*) { refreshEvidenceSummary(); }, LV_EVENT_SCREEN_LOADED, nullptr);
   return screen;
 }
 
@@ -3014,7 +4129,8 @@ lv_obj_t* buildDevicesScreen(lv_obj_t* home) {
   lv_obj_set_style_border_width(services_card, 1, 0);
   lv_obj_set_style_radius(services_card, 10, 0);
   lv_obj_set_style_pad_all(services_card, 14, 0);
-  lv_obj_clear_flag(services_card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(services_card, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(services_card, LV_SCROLLBAR_MODE_AUTO);
 
   g_device_services = lv_label_create(services_card);
   lv_obj_set_width(g_device_services, lv_pct(100));
@@ -3054,12 +4170,13 @@ std::string trustStatusLine() {
   return "Execution trust: node service offline";
 }
 
-void addSettingsSection(lv_obj_t* parent, const char* title, const char* subtitle) {
+lv_obj_t* addSettingsSection(lv_obj_t* parent, const char* title, const char* subtitle) {
   using namespace reconclave::ui;
   lv_obj_t* wrap = lv_obj_create(parent);
   lv_obj_set_size(wrap, lv_pct(100), 46);
   lv_obj_set_style_bg_opa(wrap, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(wrap, 0, 0);
+  lv_obj_set_style_shadow_width(wrap, 0, 0);
   lv_obj_set_style_pad_all(wrap, 0, 0);
   lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -3074,26 +4191,28 @@ void addSettingsSection(lv_obj_t* parent, const char* title, const char* subtitl
   lv_obj_set_style_text_font(subtitle_label, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(subtitle_label, lv_color_hex(kColorSecondary), 0);
   lv_obj_align(subtitle_label, LV_ALIGN_TOP_LEFT, 0, 30);
+  return wrap;
 }
 
-// A navigable row (target != nullptr, shows a chevron) or a purely
-// informational one (target == nullptr) - returns the row so a caller can
-// still attach its own content (see the brightness/trust rows below).
+// A navigable row (target != nullptr, shows a chevron), an action row
+// (interactive), or a purely informational row. Returns the row so callers
+// can attach content such as a slider or status label.
 lv_obj_t* addSettingsRow(lv_obj_t* parent, const char* symbol, const char* title,
-                        const char* subtitle, lv_obj_t* target) {
+                        const char* subtitle, lv_obj_t* target, bool interactive = false) {
   using namespace reconclave::ui;
-  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_t* row = target != nullptr || interactive ? lv_button_create(parent) : lv_obj_create(parent);
   lv_obj_set_size(row, lv_pct(100), 66);
   lv_obj_set_style_bg_color(row, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_bg_color(row, lv_color_hex(0x21485a), LV_STATE_PRESSED);
   lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_shadow_width(row, 0, 0);
   lv_obj_set_style_radius(row, 10, 0);
   lv_obj_set_style_pad_all(row, 14, 0);
   lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
   if (target != nullptr) {
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(row, [](lv_event_t* event) {
-      lv_screen_load(static_cast<lv_obj_t*>(lv_event_get_user_data(event)));
+      navigateToScreen(static_cast<lv_obj_t*>(lv_event_get_user_data(event)));
     }, LV_EVENT_CLICKED, target);
   }
 
@@ -3141,7 +4260,8 @@ void refreshWifiSetupList() {
   }
   for (const auto& ap : g_wifisetup_scan) {
     const std::string name = ap.ssid.empty() ? "(hidden network)" : ap.ssid;
-    lv_obj_t* row = lv_obj_create(g_wifisetup_list);
+    lv_obj_t* row = ap.secured && !ap.ssid.empty()
+        ? lv_button_create(g_wifisetup_list) : lv_obj_create(g_wifisetup_list);
     lv_obj_set_size(row, lv_pct(100), 58);
     lv_obj_set_style_bg_color(row, lv_color_hex(kColorPanelLight), 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(0x21485a), LV_STATE_PRESSED);
@@ -3177,7 +4297,7 @@ void refreshWifiSetupList() {
     // Only secured networks are tappable - reconclave-wifi always requires
     // an 8+ character password (it calls wpa_passphrase unconditionally),
     // so there's no working connect flow for open networks yet.
-    if (ap.secured) {
+    if (ap.secured && !ap.ssid.empty()) {
       lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
       auto* ssid_copy = new std::string(ap.ssid);
       lv_obj_add_event_cb(row, [](lv_event_t* event) {
@@ -3214,13 +4334,8 @@ lv_obj_t* buildWifiSetupScreen(lv_obj_t* home) {
   lv_obj_set_style_border_width(scan_button, 1, 0);
   lv_obj_set_style_shadow_width(scan_button, 0, 0);
   lv_obj_set_style_radius(scan_button, 8, 0);
-  lv_obj_add_event_cb(scan_button, [](lv_event_t*) {
-    std::string error;
-    reconclave::scanWifi("wlan0", g_wifisetup_scan, error);
-    std::sort(g_wifisetup_scan.begin(), g_wifisetup_scan.end(),
-             [](const auto& left, const auto& right) { return left.rssi_dbm > right.rssi_dbm; });
-    refreshWifiSetupList();
-  }, LV_EVENT_CLICKED, nullptr);
+  g_setup_scan_button = scan_button;
+  lv_obj_add_event_cb(scan_button, [](lv_event_t*) { runWifiScan(true); }, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* scan_label = lv_label_create(scan_button);
   lv_label_set_text(scan_label, LV_SYMBOL_REFRESH " Scan");
   lv_obj_set_style_text_color(scan_label, lv_color_hex(kColorAccent), 0);
@@ -3236,7 +4351,10 @@ lv_obj_t* buildWifiSetupScreen(lv_obj_t* home) {
   lv_obj_set_style_shadow_width(disconnect_button, 0, 0);
   lv_obj_set_style_radius(disconnect_button, 8, 0);
   lv_obj_add_event_cb(disconnect_button, [](lv_event_t*) {
-    if (g_wifi_op_running.load()) return;
+    if (g_wifi_op_running.load()) {
+      lv_label_set_text(g_wifisetup_status, "Wi-Fi is busy. Wait for the current operation to finish.");
+      return;
+    }
     lv_label_set_text(g_wifisetup_status, "Disconnecting...");
     lv_refr_now(nullptr);
     startWifiDisconnect();
@@ -3255,8 +4373,8 @@ lv_obj_t* buildWifiSetupScreen(lv_obj_t* home) {
   lv_obj_align(g_wifisetup_status, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
 
   g_wifisetup_list = lv_list_create(screen);
-  lv_obj_set_size(g_wifisetup_list, contentWidth(screen), contentHeight(screen) - 28);
-  lv_obj_align(g_wifisetup_list, LV_ALIGN_TOP_MID, 0, kContentTop + 28);
+  lv_obj_set_size(g_wifisetup_list, contentWidth(screen), contentHeight(screen) - 52);
+  lv_obj_align(g_wifisetup_list, LV_ALIGN_TOP_MID, 0, kContentTop + 52);
   lv_obj_set_style_bg_color(g_wifisetup_list, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_radius(g_wifisetup_list, 10, 0);
   lv_obj_set_style_border_width(g_wifisetup_list, 0, 0);
@@ -3268,8 +4386,12 @@ lv_obj_t* buildWifiSetupScreen(lv_obj_t* home) {
   // camera preview, since a manual Wi-Fi settings screen doesn't need
   // that and it would mean forking `iwconfig` every few seconds forever.
   lv_obj_add_event_cb(screen, [](lv_event_t*) {
-    const auto link = currentWifiLinkStatus();
     if (g_wifisetup_status == nullptr) return;
+    if (g_wifi_op_running.load()) {
+      lv_label_set_text(g_wifisetup_status, "Wi-Fi operation in progress. Please wait...");
+      return;
+    }
+    const auto link = currentWifiLinkStatus();
     lv_label_set_text(g_wifisetup_status, link.associated
         ? ("Connected to " + link.ssid + (link.ip.empty() ? "" : ("  |  " + link.ip))).c_str()
         : "Not connected.");
@@ -3302,6 +4424,7 @@ lv_obj_t* buildWifiPasswordScreen(lv_obj_t* home) {
   g_wifi_password_field = lv_textarea_create(screen);
   lv_obj_set_size(g_wifi_password_field, contentWidth(screen) - 176, 48);
   lv_obj_align(g_wifi_password_field, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop + 40);
+  lv_obj_set_style_pad_all(g_wifi_password_field, 10, 0);
   lv_textarea_set_one_line(g_wifi_password_field, true);
   lv_textarea_set_password_mode(g_wifi_password_field, true);
   lv_textarea_set_max_length(g_wifi_password_field, 63);
@@ -3321,7 +4444,10 @@ lv_obj_t* buildWifiPasswordScreen(lv_obj_t* home) {
   lv_obj_set_style_radius(g_wifi_password_connect_button, 8, 0);
   lv_obj_set_style_shadow_width(g_wifi_password_connect_button, 0, 0);
   lv_obj_add_event_cb(g_wifi_password_connect_button, [](lv_event_t*) {
-    if (g_wifi_op_running.load()) return;
+    if (g_wifi_op_running.load()) {
+      lv_label_set_text(g_wifi_password_status, "Wi-Fi is busy. Wait for the current operation to finish.");
+      return;
+    }
     const std::string password = lv_textarea_get_text(g_wifi_password_field);
     if (password.size() < 8) {
       lv_label_set_text(g_wifi_password_status, "Password must be at least 8 characters.");
@@ -3348,19 +4474,62 @@ lv_obj_t* buildWifiPasswordScreen(lv_obj_t* home) {
   return screen;
 }
 
+void showSettingsPage(bool more) {
+  using namespace reconclave::ui;
+  g_settings_show_more = more;
+  for (auto* item : g_settings_everyday_items) {
+    if (more) lv_obj_add_flag(item, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(item, LV_OBJ_FLAG_HIDDEN);
+  }
+  for (auto* item : g_settings_more_items) {
+    if (more) lv_obj_remove_flag(item, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(item, LV_OBJ_FLAG_HIDDEN);
+  }
+  for (auto* tab : {g_settings_everyday_tab, g_settings_more_tab}) {
+    if (tab == nullptr) continue;
+    const bool active = (tab == g_settings_more_tab) == more;
+    lv_obj_set_style_bg_color(tab, lv_color_hex(active ? kColorAccent : kColorPanelLight), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(tab, 0),
+                                lv_color_hex(active ? kColorPanel : kColorForeground), 0);
+  }
+  if (g_settings_list != nullptr) lv_obj_scroll_to_y(g_settings_list, 0, LV_ANIM_OFF);
+}
+
 lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t* wifi_setup_screen,
                               lv_obj_t* devices_screen, lv_obj_t* node_screen,
                               lv_obj_t* location_screen, lv_obj_t* bluetooth_screen) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
   addStatusBar(screen, "SETTINGS", true);
+  g_settings_screen = screen;
   addBackButton(screen, home);
 
+  auto make_tab = [&](const char* title, lv_coord_t x, bool more) {
+    lv_obj_t* button = lv_button_create(screen);
+    lv_obj_set_size(button, 190, kBackButtonHeight);
+    lv_obj_align(button, LV_ALIGN_TOP_LEFT, x, kSafeMargin + kStatusBarHeight + 8);
+    lv_obj_set_style_border_color(button, lv_color_hex(kColorAccent), 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_add_event_cb(button, [](lv_event_t* event) {
+      showSettingsPage(lv_event_get_user_data(event) != nullptr);
+    }, LV_EVENT_CLICKED, more ? screen : nullptr);
+    lv_obj_t* label = lv_label_create(button);
+    lv_label_set_text(label, title);
+    lv_obj_center(label);
+    return button;
+  };
+  g_settings_everyday_tab = make_tab("Everyday", kSafeMargin + 110, false);
+  g_settings_more_tab = make_tab("More options", kSafeMargin + 312, true);
+
   lv_obj_t* list = lv_obj_create(screen);
+  g_settings_list = list;
   lv_obj_set_size(list, contentWidth(screen), contentHeight(screen));
   lv_obj_align(list, LV_ALIGN_TOP_MID, 0, kContentTop);
   lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(list, 0, 0);
+  lv_obj_set_style_shadow_width(list, 0, 0);
   lv_obj_set_style_pad_all(list, 0, 0);
   lv_obj_set_style_pad_row(list, 10, 0);
   lv_obj_set_style_width(list, 5, LV_PART_SCROLLBAR);
@@ -3368,22 +4537,24 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
   lv_obj_set_style_bg_opa(list, LV_OPA_40, LV_PART_SCROLLBAR);
   lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
 
-  addSettingsSection(list, "Connections", "Network, wireless and location");
-  addSettingsRow(list, LV_SYMBOL_GPS, "Network", "Interface, route and connectivity", network_screen);
+  g_settings_everyday_items.push_back(addSettingsSection(list, "Connections", "Network and Wi-Fi"));
+  g_settings_everyday_items.push_back(addSettingsRow(list, LV_SYMBOL_GPS, "Network", "Interface, route and connectivity", network_screen));
   // Wi-Fi here means *joining* a network (like a phone's Wi-Fi settings),
   // not the WIRELESS home tile's survey/recon tool - a real, separate
   // screen (buildWifiSetupScreen), not a link to that tool. See README's
   // Settings section for why those two are deliberately not the same
   // screen.
-  addSettingsRow(list, LV_SYMBOL_WIFI, "Wi-Fi", "Connect to a wireless network", wifi_setup_screen);
-  addSettingsRow(list, LV_SYMBOL_BLUETOOTH, "Bluetooth",
-                 "Scan and connect with nRF52840 BLE", bluetooth_screen);
-  addSettingsRow(list, LV_SYMBOL_GPS, "Location", "GNSS receiver and evidence geotagging",
-                 location_screen);
+  g_settings_everyday_items.push_back(addSettingsRow(list, LV_SYMBOL_WIFI, "Wi-Fi", "Connect to a wireless network", wifi_setup_screen));
+  g_settings_more_items.push_back(addSettingsSection(list, "Other connections", "Bluetooth and location"));
+  g_settings_more_items.push_back(addSettingsRow(list, LV_SYMBOL_BLUETOOTH, "Bluetooth",
+                 "Scan and connect with nRF52840 BLE", bluetooth_screen));
+  g_settings_more_items.push_back(addSettingsRow(list, LV_SYMBOL_GPS, "Location", "GNSS receiver and evidence geotagging",
+                 location_screen));
 
-  addSettingsSection(list, "Display & hardware", "Backlight");
+  g_settings_everyday_items.push_back(addSettingsSection(list, "Display", "Backlight"));
   lv_obj_t* brightness_row = addSettingsRow(list, LV_SYMBOL_SETTINGS, "Brightness",
-                                            "Drag to adjust the panel backlight", nullptr);
+                                            "", nullptr);
+  g_settings_everyday_items.push_back(brightness_row);
   lv_obj_set_height(brightness_row, 84);
   lv_obj_t* slider = lv_slider_create(brightness_row);
   lv_obj_set_size(slider, lv_pct(100), 14);
@@ -3405,9 +4576,10 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
     if (output) output << raw << "\n";
   }, LV_EVENT_VALUE_CHANGED, nullptr);
 
+  g_settings_more_items.push_back(addSettingsSection(list, "Utilities", "Capture and battery details"));
   lv_obj_t* screenshot_row = addSettingsRow(list, LV_SYMBOL_IMAGE, "Screenshot",
-                                             "Save the active screen as a lossless PNG", nullptr);
-  lv_obj_add_flag(screenshot_row, LV_OBJ_FLAG_CLICKABLE);
+                                             "Save the active screen as a lossless PNG", nullptr, true);
+  g_settings_more_items.push_back(screenshot_row);
   g_screenshot_status = lv_label_create(screenshot_row);
   lv_label_set_text(g_screenshot_status, "TAP TO CAPTURE");
   lv_obj_set_width(g_screenshot_status, lv_pct(40));
@@ -3422,6 +4594,7 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
 
   lv_obj_t* battery_row = addSettingsRow(list, LV_SYMBOL_BATTERY_FULL, "Battery",
                                          "Keyboard-base fuel gauge", nullptr);
+  g_settings_more_items.push_back(battery_row);
   lv_obj_set_height(battery_row, 92);
   g_battery_details = lv_label_create(battery_row);
   lv_label_set_text(g_battery_details, batteryDetailsText().c_str());
@@ -3432,9 +4605,10 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
   lv_obj_set_style_text_color(g_battery_details, lv_color_hex(kColorForeground), 0);
   lv_obj_align(g_battery_details, LV_ALIGN_RIGHT_MID, 0, 0);
 
-  addSettingsSection(list, "Trust & security", "Signed remote capabilities");
+  g_settings_more_items.push_back(addSettingsSection(list, "Trust & security", "Signed remote capabilities"));
   lv_obj_t* trust_row = addSettingsRow(list, LV_SYMBOL_WARNING, "Execution trust",
                                        "Set on-device via SSH: reconclave-trust provision", nullptr);
+  g_settings_more_items.push_back(trust_row);
   g_settings_trust_status = lv_label_create(trust_row);
   lv_label_set_text(g_settings_trust_status, trustStatusLine().c_str());
   lv_obj_set_width(g_settings_trust_status, lv_pct(42));
@@ -3444,11 +4618,13 @@ lv_obj_t* buildSettingsScreen(lv_obj_t* home, lv_obj_t* network_screen, lv_obj_t
   lv_obj_set_style_text_color(g_settings_trust_status, lv_color_hex(kColorAccent), 0);
   lv_obj_align(g_settings_trust_status, LV_ALIGN_RIGHT_MID, 0, 0);
 
-  addSettingsSection(list, "System & about", "Device information and jobs");
-  addSettingsRow(list, LV_SYMBOL_SETTINGS, "Device info", "Firmware, kernel, storage and SSH",
-                 devices_screen);
-  addSettingsRow(list, LV_SYMBOL_LOOP, "Node & jobs", "Trust status, coordination and jobs",
-                 node_screen);
+  g_settings_more_items.push_back(addSettingsSection(list, "System & about", "Device information and jobs"));
+  g_settings_more_items.push_back(addSettingsRow(list, LV_SYMBOL_SETTINGS, "Device info", "Firmware, kernel, storage and SSH",
+                 devices_screen));
+  g_settings_more_items.push_back(addSettingsRow(list, LV_SYMBOL_LOOP, "Node & jobs", "Trust status, coordination and jobs",
+                 node_screen));
+
+  showSettingsPage(false);
 
   return screen;
 }
@@ -3476,6 +4652,8 @@ void startPacketCapture(const char* preset) {
     _exit(127);
   }
   g_capture_pid = child;
+  g_capture_context = currentContext();
+  g_jobs.begin(UiJob::Capture, std::string(preset) + " on " + network.iface);
   if (g_capture_stop_button != nullptr) lv_obj_clear_state(g_capture_stop_button, LV_STATE_DISABLED);
   g_capture_preset = preset;
   const std::string message = std::string(LV_SYMBOL_REFRESH) + " Capturing " + preset + " on " +
@@ -3502,6 +4680,7 @@ lv_obj_t* buildCaptureScreen(lv_obj_t* home) {
   lv_obj_add_state(stop, LV_STATE_DISABLED);
   lv_obj_add_event_cb(stop, [](lv_event_t*) {
     if (g_capture_pid > 0) {
+      g_jobs.cancelling(UiJob::Capture);
       kill(g_capture_pid, SIGTERM);
       lv_label_set_text(g_capture_status, LV_SYMBOL_STOP " Stopping capture...");
     }
@@ -3586,7 +4765,7 @@ lv_obj_t* buildCaptureScreen(lv_obj_t* home) {
   g_capture_status = lv_label_create(status_card);
   lv_label_set_text(g_capture_status,
       "READY\n\nSelect a traffic profile to record 30 seconds on the active interface.\n"
-      "The resulting PCAP and metadata are added to the evidence timeline.");
+      "The resulting PCAP is saved with the session active when capture starts.");
   lv_obj_set_width(g_capture_status, lv_pct(100));
   lv_label_set_long_mode(g_capture_status, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_style_text_font(g_capture_status, &lv_font_montserrat_16, 0);
@@ -3595,38 +4774,122 @@ lv_obj_t* buildCaptureScreen(lv_obj_t* home) {
   return screen;
 }
 
+void updateNmapScopeLabel() {
+  if (g_nmap_scope == nullptr) return;
+  const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+  const std::string target = attachedIpv4Network(iface);
+  const std::string path = iface ? g_scan_interface + " / " + interfaceIpv4Address(iface)
+                                 : routeSummaryFor(target);
+  const std::string text = "ATTACHED " + (target.empty() ? std::string("NO IPV4") : target) +
+                           "\nPATH " + path;
+  lv_label_set_text(g_nmap_scope, text.c_str());
+}
+
 void startNmap(const char* preset) {
   if (g_nmap_pid > 0) { lv_label_set_text(g_nmap_output, "SCAN ALREADY ACTIVE"); return; }
-  const std::string target = attachedIpv4Network();
+  reconclave::json::Value mission;
+  std::string mission_error;
+  if (reconclave::json::parse(readTextFile("/root/reconclave/mission/state.json"), mission, mission_error)) {
+    const auto* state = mission.find("state");
+    if (state && (state->asString() == "starting" || state->asString() == "running" ||
+                  state->asString() == "stopping")) {
+      lv_label_set_text(g_nmap_output, "ASSESSMENT ALREADY ACTIVE. Open Jobs to stop it."); return;
+    }
+  }
+  const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+  const std::string target = std::string(preset) == "enumerate" && g_nmap_target_field
+      ? lv_textarea_get_text(g_nmap_target_field) : attachedIpv4Network(iface);
   if (target.empty()) { lv_label_set_text(g_nmap_output, "NO ATTACHED IPV4 TARGET"); return; }
+  if (std::string(preset) == "enumerate" && !iface) {
+    lv_label_set_text(g_nmap_output, "SELECT ETHERNET OR WI-FI BEFORE STARTING AN AUTONOMOUS ASSESSMENT"); return;
+  }
+  if (std::string(preset) == "enumerate" &&
+      (g_project_id == "UNASSIGNED" || g_engagement_id == "UNASSIGNED")) {
+    lv_label_set_text(g_nmap_output, "SET PROJECT AND ENGAGEMENT IN SESSION BEFORE STARTING AUTO ASSESS"); return;
+  }
+  if (iface && readFirstLine("/sys/class/net/" + g_scan_interface + "/operstate") != "up") {
+    lv_label_set_text(g_nmap_output, "SELECTED INTERFACE IS DOWN"); return;
+  }
+  if (std::string(preset) == "enumerate") {
+    const pid_t launcher = fork();
+    if (launcher < 0) { lv_label_set_text(g_nmap_output, "UNABLE TO START ASSESSMENT"); return; }
+    if (launcher == 0) {
+      const int log = open("/tmp/reconclave-mission-start.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
+      execlp("reconclave-mission", "reconclave-mission", "start", target.c_str(), iface,
+             "--profile", g_scan_profile.c_str(),
+             static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    int result = 0;
+    if (waitpid(launcher, &result, 0) != launcher || !WIFEXITED(result) || WEXITSTATUS(result) != 0) {
+      lv_label_set_text(g_nmap_output,
+          ("ASSESSMENT COULD NOT START\n" + readTextFile("/tmp/reconclave-mission-start.log")).c_str());
+      return;
+    }
+    lv_label_set_text(g_nmap_output,
+        ("ASSESSMENT STARTED\nScope: " + target + "\nInterface: " + g_scan_interface +
+         "\nYou can leave this screen; monitor or stop the job in Jobs.").c_str());
+    return;
+  }
   const pid_t child = fork();
   if (child < 0) { lv_label_set_text(g_nmap_output, "UNABLE TO START NMAP"); return; }
   if (child == 0) {
     const int log = open("/tmp/reconclave-nmap.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
-    execlp("reconclave-nmap", "reconclave-nmap", target.c_str(), preset, static_cast<char*>(nullptr));
+    if (iface) setenv("RECONCLAVE_SCAN_INTERFACE", iface, 1);
+    else unsetenv("RECONCLAVE_SCAN_INTERFACE");
+    if (std::string(preset) == "enumerate")
+      execlp("reconclave-enumerate", "reconclave-enumerate", target.c_str(), static_cast<char*>(nullptr));
+    else if (std::string(preset) == "passive")
+      execlp("reconclave-passive", "reconclave-passive", target.c_str(), static_cast<char*>(nullptr));
+    else
+      execlp("reconclave-nmap", "reconclave-nmap", target.c_str(), preset, static_cast<char*>(nullptr));
     _exit(127);
   }
   g_nmap_pid = child;
+  g_nmap_context = currentContext();
+  g_jobs.begin(UiJob::Nmap, std::string(preset) + " / " + target + " / " +
+                                (iface ? iface : "auto"));
   lv_label_set_text(g_nmap_output,
-      (std::string("RUNNING // ") + preset + " // " + target + "\nOutput will appear when complete...").c_str());
+      (std::string("RUNNING // ") + preset + " // " + target + " // " +
+       (iface ? iface : "kernel route") + "\nOutput will appear when complete...").c_str());
+}
+
+void resumeNmapMission() {
+  const pid_t launcher = fork();
+  if (launcher < 0) { lv_label_set_text(g_nmap_output, "UNABLE TO RESUME ASSESSMENT"); return; }
+  if (launcher == 0) {
+    const int log = open("/tmp/reconclave-mission-start.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
+    execlp("reconclave-mission", "reconclave-mission", "resume", static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  int result = 0;
+  if (waitpid(launcher, &result, 0) != launcher || !WIFEXITED(result) || WEXITSTATUS(result) != 0)
+    lv_label_set_text(g_nmap_output,
+        ("RESUME REFUSED\n" + readTextFile("/tmp/reconclave-mission-start.log")).c_str());
+  else
+    lv_label_set_text(g_nmap_output, "ASSESSMENT RESUMED\nCompleted stages will be reused after scope and link checks.");
 }
 
 lv_obj_t* buildNmapScreen(lv_obj_t* home) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
-  addStatusBar(screen, "NMAP", true);
+  addStatusBar(screen, "SCAN NETWORK", true);
   addBackButton(screen, home);
-  struct Choice { const char* title; const char* preset; const char* symbol; };
+  struct Choice { const char* title; const char* preset; };
   static const Choice choices[] = {
-      {"HOST DISCOVERY", "discovery", LV_SYMBOL_REFRESH},
-      {"QUICK PORTS", "quick", LV_SYMBOL_EYE_OPEN},
-      {"SERVICE ID", "services", LV_SYMBOL_EYE_OPEN},
+      {"AUTO ASSESS", "enumerate"},
+      {"PASSIVE", "passive"},
+      {"DISCOVER", "discovery"},
+      {"PORTS", "quick"},
+      {"IDENTIFY", "services"},
   };
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 5; ++i) {
     lv_obj_t* button = lv_button_create(screen);
-    lv_obj_set_size(button, 270, kBackButtonHeight);
-    lv_obj_align(button, LV_ALIGN_TOP_LEFT, kSafeMargin + 100 + i * 282,
+    lv_obj_set_size(button, 165, kBackButtonHeight);
+    lv_obj_align(button, LV_ALIGN_TOP_LEFT, kSafeMargin + 100 + i * 176,
                  kSafeMargin + kStatusBarHeight + 8);
     lv_obj_set_style_bg_color(button, lv_color_hex(kColorPanelLight), 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(0x245267), LV_STATE_PRESSED);
@@ -3638,14 +4901,29 @@ lv_obj_t* buildNmapScreen(lv_obj_t* home) {
       startNmap(static_cast<const char*>(lv_event_get_user_data(event)));
     }, LV_EVENT_CLICKED, const_cast<char*>(choices[i].preset));
     lv_obj_t* label = lv_label_create(button);
-    const std::string action = std::string(choices[i].symbol) + "  " + choices[i].title;
-    lv_label_set_text(label, action.c_str());
-    lv_obj_set_width(label, lv_pct(94));
+    lv_label_set_text(label, choices[i].title);
+    lv_obj_set_width(label, 145);
     lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(label, lv_color_hex(kColorForeground), 0);
     lv_obj_center(label);
   }
+  g_nmap_interface_choice = lv_dropdown_create(screen);
+  lv_obj_set_size(g_nmap_interface_choice, 196, kBackButtonHeight);
+  lv_obj_align(g_nmap_interface_choice, LV_ALIGN_TOP_RIGHT, -kSafeMargin, kSafeMargin + kStatusBarHeight + 8);
+  lv_dropdown_set_options(g_nmap_interface_choice, "Choose interface\nEthernet\nWi-Fi");
+  lv_obj_set_style_bg_color(g_nmap_interface_choice, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(g_nmap_interface_choice, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(g_nmap_interface_choice, 1, 0);
+  lv_obj_set_style_radius(g_nmap_interface_choice, 8, 0);
+  lv_obj_set_style_text_color(g_nmap_interface_choice, lv_color_hex(kColorForeground), 0);
+  lv_obj_set_style_text_font(g_nmap_interface_choice, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_bg_color(lv_dropdown_get_list(g_nmap_interface_choice), lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_text_color(lv_dropdown_get_list(g_nmap_interface_choice), lv_color_hex(kColorForeground), 0);
+  lv_obj_add_event_cb(g_nmap_interface_choice, [](lv_event_t* event) {
+    selectScanInterface(lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(event))));
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
   lv_obj_t* pane = lv_obj_create(screen);
   lv_obj_set_size(pane, contentWidth(screen), contentHeight(screen));
   lv_obj_align(pane, LV_ALIGN_TOP_LEFT, kSafeMargin, kContentTop);
@@ -3663,29 +4941,101 @@ lv_obj_t* buildNmapScreen(lv_obj_t* home) {
   lv_obj_align(output_heading, LV_ALIGN_TOP_LEFT, 0, 0);
 
   g_nmap_scope = lv_label_create(pane);
-  lv_obj_set_width(g_nmap_scope, lv_pct(42));
+  lv_obj_set_width(g_nmap_scope, lv_pct(48));
   lv_label_set_long_mode(g_nmap_scope, LV_LABEL_LONG_MODE_DOTS);
   lv_obj_set_style_text_align(g_nmap_scope, LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_set_style_text_font(g_nmap_scope, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(g_nmap_scope, lv_color_hex(kColorAmber), 0);
   lv_obj_align(g_nmap_scope, LV_ALIGN_TOP_RIGHT, 0, 0);
   lv_obj_add_event_cb(screen, [](lv_event_t*) {
-    const std::string target = attachedIpv4Network();
-    const std::string scope = "SCOPE  //  " + (target.empty() ? std::string("NO ATTACHED IPV4") : target);
-    lv_label_set_text(g_nmap_scope, scope.c_str());
+    lv_dropdown_set_selected(g_nmap_interface_choice, scanInterfaceIndex());
+    updateNmapScopeLabel();
+    if (g_nmap_target_field && !*lv_textarea_get_text(g_nmap_target_field)) {
+      const char* iface = g_scan_interface.empty() ? nullptr : g_scan_interface.c_str();
+      lv_textarea_set_text(g_nmap_target_field, attachedIpv4Network(iface).c_str());
+    }
   }, LV_EVENT_SCREEN_LOADED, nullptr);
 
+  auto* target_label = lv_label_create(pane);
+  lv_label_set_text(target_label, "AUTO ASSESS SCOPE (CIDR)");
+  lv_obj_set_style_text_font(target_label, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(target_label, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(target_label, LV_ALIGN_TOP_LEFT, 0, 36);
+  g_nmap_target_field = lv_textarea_create(pane);
+  lv_obj_set_size(g_nmap_target_field, 300, 44);
+  lv_obj_align(g_nmap_target_field, LV_ALIGN_TOP_LEFT, 0, 56);
+  lv_textarea_set_one_line(g_nmap_target_field, true);
+  lv_textarea_set_max_length(g_nmap_target_field, 18);
+  lv_textarea_set_placeholder_text(g_nmap_target_field, "192.168.8.0/27");
+  lv_obj_set_style_bg_color(g_nmap_target_field, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_text_color(g_nmap_target_field, lv_color_hex(kColorForeground), 0);
+  lv_obj_set_style_border_color(g_nmap_target_field, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_border_width(g_nmap_target_field, 1, 0);
+  lv_obj_set_style_radius(g_nmap_target_field, 8, 0);
+  lv_obj_set_style_pad_all(g_nmap_target_field, 8, 0);
+  auto* profile_label = lv_label_create(pane);
+  lv_label_set_text(profile_label, "SCAN DEPTH");
+  lv_obj_set_style_text_font(profile_label, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(profile_label, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(profile_label, LV_ALIGN_TOP_LEFT, 316, 36);
+  g_nmap_profile_choice = lv_dropdown_create(pane);
+  lv_obj_set_size(g_nmap_profile_choice, 180, 44);
+  lv_obj_align(g_nmap_profile_choice, LV_ALIGN_TOP_LEFT, 316, 56);
+  lv_dropdown_set_options(g_nmap_profile_choice, "Balanced 15m\nDeep 30m");
+  lv_obj_set_style_bg_color(g_nmap_profile_choice, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(g_nmap_profile_choice, lv_color_hex(kColorAccent), 0);
+  lv_obj_set_style_text_color(g_nmap_profile_choice, lv_color_hex(kColorForeground), 0);
+  lv_obj_set_style_text_font(g_nmap_profile_choice, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_shadow_width(g_nmap_profile_choice, 0, 0);
+  lv_obj_add_event_cb(g_nmap_profile_choice, [](lv_event_t* event) {
+    g_scan_profile = lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(event))) == 1
+        ? "deep" : "balanced";
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  auto* resume_heading = lv_label_create(pane);
+  lv_label_set_text(resume_heading, "INTERRUPTED RUN");
+  lv_obj_set_style_text_font(resume_heading, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(resume_heading, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(resume_heading, LV_ALIGN_TOP_LEFT, 512, 36);
+  g_nmap_resume_button = lv_button_create(pane);
+  lv_obj_set_size(g_nmap_resume_button, 150, 44);
+  lv_obj_align(g_nmap_resume_button, LV_ALIGN_TOP_LEFT, 512, 56);
+  lv_obj_set_style_bg_color(g_nmap_resume_button, lv_color_hex(kColorPanelLight), 0);
+  lv_obj_set_style_border_color(g_nmap_resume_button, lv_color_hex(kColorAmber), 0);
+  lv_obj_set_style_border_width(g_nmap_resume_button, 1, 0);
+  lv_obj_set_style_shadow_width(g_nmap_resume_button, 0, 0);
+  lv_obj_add_state(g_nmap_resume_button, LV_STATE_DISABLED);
+  lv_obj_add_event_cb(g_nmap_resume_button, [](lv_event_t*) { resumeNmapMission(); }, LV_EVENT_CLICKED, nullptr);
+  auto* resume_label = lv_label_create(g_nmap_resume_button);
+  lv_label_set_text(resume_label, "RESUME LAST");
+  lv_obj_set_style_text_color(resume_label, lv_color_hex(kColorForeground), 0);
+  lv_obj_center(resume_label);
+  auto* target_keyboard = lv_keyboard_create(screen);
+  lv_obj_set_size(target_keyboard, contentWidth(screen), 210);
+  lv_obj_align(target_keyboard, LV_ALIGN_BOTTOM_MID, 0, -kSafeMargin);
+  lv_obj_add_flag(target_keyboard, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_bg_color(target_keyboard, lv_color_hex(kColorPanel), 0);
+  lv_obj_add_event_cb(g_nmap_target_field, [](lv_event_t* event) {
+    auto* keyboard = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+    lv_keyboard_set_textarea(keyboard, g_nmap_target_field);
+    lv_obj_remove_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(keyboard);
+  }, LV_EVENT_CLICKED, target_keyboard);
+  lv_obj_add_event_cb(target_keyboard, [](lv_event_t* event) {
+    if (lv_event_get_code(event) == LV_EVENT_READY || lv_event_get_code(event) == LV_EVENT_CANCEL)
+      lv_obj_add_flag(static_cast<lv_obj_t*>(lv_event_get_target(event)), LV_OBJ_FLAG_HIDDEN);
+  }, LV_EVENT_ALL, nullptr);
+
   g_nmap_output = lv_label_create(pane);
-  lv_label_set_text(g_nmap_output, "READY\n\nSelect a scan preset above to begin.");
+  lv_label_set_text(g_nmap_output, "Select Ethernet or Wi-Fi, enter the authorised CIDR, and choose Balanced or Deep. Deep checks all TCP ports on up to four responding hosts after the standard stages; it can run for 30 minutes. The job keeps running when you leave this screen. Resume reuses complete stages only on the same session and link.\n\nPASSIVE listens without probing. DISCOVER / PORTS / IDENTIFY run individual manual steps. Reports appear in Evidence; hosts appear in Explore.");
   lv_obj_set_width(g_nmap_output, lv_pct(100));
   lv_label_set_long_mode(g_nmap_output, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_style_text_font(g_nmap_output, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(g_nmap_output, lv_color_hex(kColorForeground), 0);
-  lv_obj_align(g_nmap_output, LV_ALIGN_TOP_LEFT, 0, 34);
+  lv_obj_align(g_nmap_output, LV_ALIGN_TOP_LEFT, 0, 116);
   return screen;
 }
 
-lv_obj_t* createHomeAction(lv_obj_t* parent, int index, const char* title, const char* detail,
+lv_obj_t* createHomeAction(lv_obj_t* parent, const char* title, const char* detail,
                            const char* symbol, const char* badge, std::uint32_t color,
                            lv_obj_t* target, bool scan_wifi = false) {
   using namespace reconclave::ui;
@@ -3700,41 +5050,35 @@ lv_obj_t* createHomeAction(lv_obj_t* parent, int index, const char* title, const
   lv_obj_set_style_shadow_opa(card, LV_OPA_20, 0);
   lv_obj_set_style_pad_all(card, 12, 0);
 
-  char number[8]; std::snprintf(number, sizeof(number), "%02d", index);
-  lv_obj_t* number_label = lv_label_create(card);
-  lv_label_set_text(number_label, number);
-  lv_obj_set_style_text_font(number_label, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(number_label, lv_color_hex(kColorSecondary), 0);
-  lv_obj_align(number_label, LV_ALIGN_TOP_LEFT, 0, 0);
   lv_obj_t* icon = lv_label_create(card);
   lv_label_set_text(icon, symbol);
   lv_obj_set_style_text_font(icon, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(icon, lv_color_hex(color), 0);
-  lv_obj_align(icon, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 0, 0);
   lv_obj_t* title_label = lv_label_create(card);
   lv_label_set_text(title_label, title);
   lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(title_label, lv_color_hex(kColorForeground), 0);
-  lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 0, -8);
+  lv_obj_set_width(title_label, lv_pct(68));
+  lv_label_set_long_mode(title_label, LV_LABEL_LONG_MODE_DOTS);
+  lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, 40, 0);
   lv_obj_t* detail_label = lv_label_create(card);
   lv_label_set_text(detail_label, detail);
-  // Reserve the right-hand quarter for the action badge. Several useful
-  // descriptions are long enough to collide with it at 88% card width.
-  lv_obj_set_width(detail_label, lv_pct(72));
-  lv_label_set_long_mode(detail_label, LV_LABEL_LONG_MODE_DOTS);
-  lv_obj_set_style_text_font(detail_label, &lv_font_montserrat_12, 0);
+  lv_obj_set_width(detail_label, lv_pct(100));
+  lv_label_set_long_mode(detail_label, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_set_style_text_font(detail_label, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(detail_label, lv_color_hex(kColorSecondary), 0);
   lv_obj_align(detail_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
   lv_obj_t* badge_label = lv_label_create(card);
   lv_label_set_text(badge_label, badge);
   lv_obj_set_style_text_font(badge_label, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(badge_label, lv_color_hex(color), 0);
-  lv_obj_align(badge_label, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_align(badge_label, LV_ALIGN_TOP_RIGHT, 0, 4);
   struct Launch { lv_obj_t* target; bool scan; };
   auto* launch = new Launch{target, scan_wifi};
   lv_obj_add_event_cb(card, [](lv_event_t* event) {
     auto* launch = static_cast<Launch*>(lv_event_get_user_data(event));
-    lv_screen_load(launch->target);
+    reconclave::ui::navigateToScreen(launch->target);
     if (launch->scan) runWifiScan();
   }, LV_EVENT_CLICKED, launch);
   lv_obj_add_event_cb(card, [](lv_event_t* event) {
@@ -3752,7 +5096,7 @@ lv_obj_t* createHomeUtility(lv_obj_t* parent, const char* symbol, const char* ti
   lv_obj_set_style_radius(button, 7, 0);
   lv_obj_set_style_shadow_width(button, 0, 0);
   lv_obj_add_event_cb(button, [](lv_event_t* event) {
-    lv_screen_load(static_cast<lv_obj_t*>(lv_event_get_user_data(event)));
+    navigateToScreen(static_cast<lv_obj_t*>(lv_event_get_user_data(event)));
   }, LV_EVENT_CLICKED, target);
   lv_obj_t* label = lv_label_create(button);
   const std::string text = std::string(symbol) + "  " + title;
@@ -3763,17 +5107,16 @@ lv_obj_t* createHomeUtility(lv_obj_t* parent, const char* symbol, const char* ti
   return button;
 }
 
-lv_obj_t* buildToolsScreen(lv_obj_t* home, lv_obj_t* recon_screen, lv_obj_t* nmap_screen,
-                           lv_obj_t* wireless_screen, lv_obj_t* capture_screen,
-                           lv_obj_t* findings_screen, lv_obj_t* evidence_screen,
-                           lv_obj_t* vision_screen, lv_obj_t* location_screen) {
+lv_obj_t* buildToolsScreen(lv_obj_t* home, lv_obj_t* wireless_screen,
+                           lv_obj_t* capture_screen, lv_obj_t* vision_screen,
+                           lv_obj_t* location_screen) {
   using namespace reconclave::ui;
   lv_obj_t* screen = createScreen();
   addStatusBar(screen, "TOOLS", true);
   addBackButton(screen, home);
 
   lv_obj_t* heading = lv_label_create(screen);
-  lv_label_set_text(heading, "FIELD TOOLKIT  //  DISCOVER  •  INSPECT  •  RECORD");
+  lv_label_set_text(heading, "Additional field tools");
   lv_obj_set_style_text_font(heading, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(heading, lv_color_hex(kColorAccent), 0);
   lv_obj_align(heading, LV_ALIGN_TOP_LEFT, kSafeMargin + 110,
@@ -3786,7 +5129,7 @@ lv_obj_t* buildToolsScreen(lv_obj_t* home, lv_obj_t* recon_screen, lv_obj_t* nma
   lv_obj_set_style_border_width(grid, 0, 0);
   lv_obj_set_style_pad_all(grid, 0, 0);
   lv_obj_set_style_pad_gap(grid, 10, 0);
-  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_COLUMN);
   lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
 
   struct ToolSpec {
@@ -3799,28 +5142,19 @@ lv_obj_t* buildToolsScreen(lv_obj_t* home, lv_obj_t* recon_screen, lv_obj_t* nma
     bool scan;
   };
   const ToolSpec tools[] = {
-      {"LAN SURVEY", "Hosts, ports and service posture", LV_SYMBOL_REFRESH, "DISCOVER", kColorAccent, recon_screen, false},
-      {"NMAP", "Focused host and service scans", LV_SYMBOL_EYE_OPEN, "SCAN", kColorAmber, nmap_screen, false},
-      {"WI-FI SURVEY", "Access points, channels and security", LV_SYMBOL_WIFI, "RF", kColorAccent, wireless_screen, true},
-      {"PACKET CAPTURE", "Scoped traffic capture to PCAP", LV_SYMBOL_DOWNLOAD, "PCAP", kColorAmber, capture_screen, false},
-      {"FINDINGS", "Review noteworthy discovered services", LV_SYMBOL_WARNING, "REVIEW", kColorAmber, findings_screen, false},
-      {"EVIDENCE", "Exports, timeline and integrity", LV_SYMBOL_DIRECTORY, "STORE", kColorAccent, evidence_screen, false},
-      {"VISION", "Capture photographic assessment evidence", LV_SYMBOL_IMAGE, "CAM", kColorAccent, vision_screen, false},
-      {"LOCATION", "GNSS status and evidence geotagging", LV_SYMBOL_GPS, "GNSS", kColorAmber, location_screen, false},
+      {"WI-FI SURVEY", "Find access points and compare channels", LV_SYMBOL_WIFI, "WIRELESS", kColorAccent, wireless_screen, true},
+      {"PACKET CAPTURE", "Record network traffic for later analysis", LV_SYMBOL_DOWNLOAD, "PCAP", kColorAmber, capture_screen, false},
+      {"CAMERA", "Photograph the assessment environment", LV_SYMBOL_IMAGE, "PHOTO", kColorAccent, vision_screen, false},
+      {"LOCATION", "Check GNSS and geotag supported evidence", LV_SYMBOL_GPS, "GNSS", kColorAmber, location_screen, false},
   };
   constexpr lv_coord_t kGap = 10;
-  const lv_coord_t card_width = (contentWidth(screen) - 3 * kGap) / 4;
-  const lv_coord_t card_height = (contentHeight(screen) - kGap) / 2;
-  for (int i = 0; i < 8; ++i) {
-    lv_obj_t* card = createHomeAction(grid, i + 1, tools[i].title, tools[i].detail,
+  const lv_coord_t card_width = contentWidth(screen);
+  const lv_coord_t card_height = (contentHeight(screen) - 3 * kGap) / 4;
+  for (int i = 0; i < 4; ++i) {
+    lv_obj_t* card = createHomeAction(grid, tools[i].title, tools[i].detail,
                                       tools[i].symbol, tools[i].badge, tools[i].color,
                                       tools[i].target, tools[i].scan);
     lv_obj_set_size(card, card_width, card_height);
-    if (tools[i].target == findings_screen) {
-      lv_obj_add_event_cb(card, [](lv_event_t* event) {
-        g_findings_return = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
-      }, LV_EVENT_CLICKED, screen);
-    }
   }
   return screen;
 }
@@ -3891,7 +5225,7 @@ int main() {
 
   lv_obj_t* home = createScreen();
   g_home_screen = home;
-  addStatusBar(home, "RECONCLAVE", true);
+  addStatusBar(home, "SIGHTLINE", networkState().connected);
 
   lv_obj_t* network_screen = buildNetworkScreen(home);
   lv_obj_t* wireless_screen = buildWirelessScreen(home);
@@ -3908,6 +5242,8 @@ int main() {
   lv_obj_t* bluetooth_screen = buildBluetoothScreen(home);
   lv_obj_t* assessment_screen = buildAssessmentScreen(home);
   lv_obj_t* node_screen = buildNodeScreen(home);
+  lv_obj_t* jobs_screen = buildJobsScreen(home);
+  buildEvidenceBrowser(home);
   lv_obj_t* evidence_screen = buildEvidenceScreen(home);
   lv_obj_t* devices_screen = buildDevicesScreen(home);
   buildWifiPasswordScreen(home);  // sets g_wifi_password_screen; opened only from Wi-Fi setup's list.
@@ -3917,23 +5253,28 @@ int main() {
                                                   bluetooth_screen);
   lv_obj_t* capture_screen = buildCaptureScreen(home);
   lv_obj_t* nmap_screen = buildNmapScreen(home);
-  lv_obj_t* tools_screen = buildToolsScreen(home, recon_screen, nmap_screen, wireless_screen,
-                                             capture_screen, g_findings_screen, evidence_screen,
+  lv_obj_t* tools_screen = buildToolsScreen(home, wireless_screen, capture_screen,
                                              vision_screen, location_screen);
   g_ui_screens = {
-      {"home", home}, {"tools", tools_screen}, {"network", network_screen},
+      {"home", home}, {"jobs", jobs_screen}, {"tools", tools_screen}, {"network", network_screen},
       {"wifi-survey", wireless_screen}, {"wifi-setup", wifi_setup_screen},
-      {"recon", recon_screen}, {"findings", g_findings_screen}, {"nmap", nmap_screen},
+      {"assets", recon_screen}, {"recon", recon_screen}, {"findings", g_findings_screen}, {"nmap", nmap_screen},
       {"packet", capture_screen}, {"evidence", evidence_screen}, {"vision", vision_screen},
+      {"evidence-files", g_evidence_browser},
       {"location", location_screen}, {"session", assessment_screen}, {"node", node_screen},
       {"device", devices_screen}, {"settings", settings_screen}, {"bluetooth", bluetooth_screen},
   };
 
-  // Home is deliberately asymmetric: a persistent mission strip gives
-  // context, while the larger command deck reserves visual weight for the
-  // tools an operator actually launches in the field.
+  // Home follows the field workflow. Specialist controls remain in All tools.
   lv_obj_t* mission = lv_obj_create(home);
-  lv_obj_set_size(mission, 258, 464);
+  const lv_coord_t home_width = contentWidth(home);
+  const lv_coord_t home_top = kSafeMargin + kStatusBarHeight + 12;
+  const lv_coord_t home_height = lv_display_get_vertical_resolution(display) - home_top - kSafeMargin;
+  const lv_coord_t sidebar_width = 258;
+  const lv_coord_t deck_left = kSafeMargin + sidebar_width + 16;
+  const lv_coord_t deck_width = home_width - sidebar_width - 16;
+  const lv_coord_t deck_height = home_height - 32 - 94;
+  lv_obj_set_size(mission, sidebar_width, home_height);
   lv_obj_align(mission, LV_ALIGN_TOP_LEFT, kSafeMargin, kSafeMargin + kStatusBarHeight + 12);
   lv_obj_set_style_bg_color(mission, lv_color_hex(0x091922), 0);
   lv_obj_set_style_border_color(mission, lv_color_hex(kColorAmber), 0);
@@ -3943,12 +5284,12 @@ int main() {
   lv_obj_set_style_pad_all(mission, 16, 0);
   lv_obj_clear_flag(mission, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t* mode = lv_label_create(mission);
-  lv_label_set_text(mode, "ZETA // FIELD OPS");
+  lv_label_set_text(mode, "SCAN SETUP");
   lv_obj_set_style_text_font(mode, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(mode, lv_color_hex(kColorAmber), 0);
   lv_obj_align(mode, LV_ALIGN_TOP_LEFT, 0, 0);
   lv_obj_t* mission_title = lv_label_create(mission);
-  lv_label_set_text(mission_title, "MISSION\nCONTROL");
+  lv_label_set_text(mission_title, "Scan\ncontext");
   lv_obj_set_style_text_font(mission_title, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(mission_title, lv_color_hex(kColorForeground), 0);
   lv_obj_align(mission_title, LV_ALIGN_TOP_LEFT, 0, 30);
@@ -3957,12 +5298,19 @@ int main() {
   lv_obj_align(divider, LV_ALIGN_TOP_LEFT, 0, 94);
   lv_obj_set_style_bg_color(divider, lv_color_hex(kColorUnavailable), 0);
   lv_obj_set_style_border_width(divider, 0, 0);
-  g_home_context = lv_label_create(mission);
+  lv_obj_t* context_area = lv_obj_create(mission);
+  lv_obj_set_size(context_area, lv_pct(100), home_height - 216);
+  lv_obj_align(context_area, LV_ALIGN_TOP_LEFT, 0, 112);
+  lv_obj_set_style_bg_opa(context_area, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(context_area, 0, 0);
+  lv_obj_set_style_pad_all(context_area, 0, 0);
+  lv_obj_set_scroll_dir(context_area, LV_DIR_VER);
+  g_home_context = lv_label_create(context_area);
   lv_obj_set_width(g_home_context, lv_pct(100));
-  lv_label_set_long_mode(g_home_context, LV_LABEL_LONG_MODE_DOTS);
+  lv_label_set_long_mode(g_home_context, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_style_text_font(g_home_context, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(g_home_context, lv_color_hex(kColorSecondary), 0);
-  lv_obj_align(g_home_context, LV_ALIGN_TOP_LEFT, 0, 112);
+  lv_obj_align(g_home_context, LV_ALIGN_TOP_LEFT, 0, 0);
   g_home_readiness = lv_label_create(mission);
   lv_obj_set_width(g_home_readiness, lv_pct(100));
   lv_label_set_long_mode(g_home_readiness, LV_LABEL_LONG_MODE_WRAP);
@@ -3971,42 +5319,44 @@ int main() {
   lv_obj_align(g_home_readiness, LV_ALIGN_BOTTOM_LEFT, 0, -2);
 
   lv_obj_t* deck_title = lv_label_create(home);
-  lv_label_set_text(deck_title, "COMMAND DECK  //  SELECT MODULE");
+  lv_label_set_text(deck_title, "What would you like to do?");
   lv_obj_set_style_text_font(deck_title, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(deck_title, lv_color_hex(kColorAccent), 0);
-  lv_obj_align(deck_title, LV_ALIGN_TOP_LEFT, 294, 88);
+  lv_obj_align(deck_title, LV_ALIGN_TOP_LEFT, deck_left, home_top + 4);
+
+  auto* activity_link = createHomeUtility(home, LV_SYMBOL_LIST, "Jobs: 0 running", jobs_screen);
+  lv_obj_set_size(activity_link, 240, 28);
+  lv_obj_align(activity_link, LV_ALIGN_TOP_RIGHT, -kSafeMargin, home_top);
+  g_home_jobs = lv_obj_get_child(activity_link, 0);
 
   lv_obj_t* deck = lv_obj_create(home);
-  lv_obj_set_size(deck, 918, 330);
-  lv_obj_align(deck, LV_ALIGN_TOP_LEFT, 294, 116);
+  lv_obj_set_size(deck, deck_width, deck_height);
+  lv_obj_align(deck, LV_ALIGN_TOP_LEFT, deck_left, home_top + 32);
   lv_obj_set_style_bg_opa(deck, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(deck, 0, 0);
   lv_obj_set_style_pad_all(deck, 0, 0);
   lv_obj_set_style_pad_gap(deck, 12, 0);
-  lv_obj_set_flex_flow(deck, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_flex_flow(deck, LV_FLEX_FLOW_COLUMN);
   lv_obj_clear_flag(deck, LV_OBJ_FLAG_SCROLLABLE);
   struct HomeSpec { const char* title; const char* detail; const char* symbol; const char* badge;
                     std::uint32_t color; lv_obj_t* target; bool scan; };
   const HomeSpec primary[] = {
-      {"WI-FI OPS", "Survey APs and channel posture", LV_SYMBOL_WIFI, "SCAN", kColorAccent, wireless_screen, true},
-      {"NMAP", "Discover hosts, ports and services", LV_SYMBOL_EYE_OPEN, "SCAN", kColorAmber, nmap_screen, false},
-      {"PACKETS", "Capture scoped traffic to evidence", LV_SYMBOL_DOWNLOAD, "PCAP", kColorAccent, capture_screen, false},
-      {"EVIDENCE", "Timeline, exports and integrity", LV_SYMBOL_DIRECTORY, "STORE", kColorAmber, evidence_screen, false},
-      {"VISION", "Capture visual assessment evidence", LV_SYMBOL_IMAGE, "CAM", kColorAccent, vision_screen, false},
-      {"REMOTE NODE", "Jobs, trust and coordination", LV_SYMBOL_LOOP, "RCN", kColorAmber, node_screen, false},
+      {"1  Scan", "Choose Ethernet or Wi-Fi, then find hosts and services", LV_SYMBOL_REFRESH, "START HERE", kColorAccent, nmap_screen, false},
+      {"2  Explore", "See discovered devices and open one for details", LV_SYMBOL_EYE_OPEN, "ASSETS", kColorAccent, recon_screen, false},
+      {"3  Review", "Check observations that may need attention", LV_SYMBOL_WARNING, "FINDINGS", kColorAmber, g_findings_screen, false},
   };
-  const lv_coord_t action_w = (918 - 24) / 3;
-  const lv_coord_t action_h = (330 - 12) / 2;
-  for (int i = 0; i < 6; ++i) {
-    lv_obj_t* action = createHomeAction(deck, i + 1, primary[i].title, primary[i].detail,
+  const lv_coord_t action_w = deck_width;
+  const lv_coord_t action_h = (deck_height - 24) / 3;
+  for (int i = 0; i < 3; ++i) {
+    lv_obj_t* action = createHomeAction(deck, primary[i].title, primary[i].detail,
                                         primary[i].symbol, primary[i].badge, primary[i].color,
                                         primary[i].target, primary[i].scan);
     lv_obj_set_size(action, action_w, action_h);
   }
 
   lv_obj_t* dock = lv_obj_create(home);
-  lv_obj_set_size(dock, 918, 78);
-  lv_obj_align(dock, LV_ALIGN_TOP_LEFT, 294, 470);
+  lv_obj_set_size(dock, deck_width, 78);
+  lv_obj_align(dock, LV_ALIGN_TOP_LEFT, deck_left, home_top + home_height - 78);
   lv_obj_set_style_bg_color(dock, lv_color_hex(0x091922), 0);
   lv_obj_set_style_border_width(dock, 0, 0);
   lv_obj_set_style_radius(dock, 10, 0);
@@ -4015,19 +5365,22 @@ int main() {
   lv_obj_set_flex_flow(dock, LV_FLEX_FLOW_ROW);
   lv_obj_clear_flag(dock, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t* utilities[] = {
-      createHomeUtility(dock, LV_SYMBOL_LIST, "TOOLS", tools_screen),
-      createHomeUtility(dock, LV_SYMBOL_GPS, "NETWORK", network_screen),
-      createHomeUtility(dock, LV_SYMBOL_EDIT, "SESSION", assessment_screen),
-      createHomeUtility(dock, LV_SYMBOL_SETTINGS, "DEVICE", devices_screen),
-      createHomeUtility(dock, LV_SYMBOL_SETTINGS, "SETTINGS", settings_screen),
+      createHomeUtility(dock, LV_SYMBOL_DIRECTORY, "Evidence", evidence_screen),
+      createHomeUtility(dock, LV_SYMBOL_LIST, "Jobs", jobs_screen),
+      createHomeUtility(dock, LV_SYMBOL_LIST, "All tools", tools_screen),
+      createHomeUtility(dock, LV_SYMBOL_EDIT, "Session", assessment_screen),
+      createHomeUtility(dock, LV_SYMBOL_SETTINGS, "Settings", settings_screen),
   };
-  for (auto* utility : utilities) lv_obj_set_size(utility, (918 - 20 - 32) / 5, 58);
+  for (auto* utility : utilities) lv_obj_set_size(utility, (deck_width - 20 - 32) / 5, 58);
 
   refreshLiveDetails(nullptr);
   g_ble.open();
   refreshBluetoothDetails(nullptr);
   lv_timer_create(refreshBluetoothDetails, 100, nullptr);
   lv_timer_create(refreshLiveDetails, 3000, nullptr);
+  lv_timer_create(finishWifiSurvey, 100, nullptr);
+  lv_timer_create(pollEvidenceTask, 100, nullptr);
+  lv_timer_create(refreshJobs, 500, nullptr);
   lv_timer_create(pollHardwareKeyboard, 25, nullptr);
   lv_screen_load(home);
 
@@ -4043,6 +5396,30 @@ int main() {
   // (handleSignal) can land while either worker is running regardless of
   // which screen was active.
   stopPreviewWorker();
+  // Let wrapper traps finish/reap their own children before the UI exits.
+  if (g_capture_pid > 0) kill(g_capture_pid, SIGTERM);
+  if (g_nmap_pid > 0) kill(g_nmap_pid, SIGTERM);
+  for (int attempt = 0; attempt < 60 && (g_capture_pid > 0 || g_nmap_pid > 0 || g_screenshot_pid > 0); ++attempt) {
+    int status = 0;
+    if (g_capture_pid > 0 && waitpid(g_capture_pid, &status, WNOHANG) == g_capture_pid) {
+      const auto path = artifactFromOutput(readTextFile("/tmp/reconclave-capture.log"));
+      if (!path.empty()) attributeArtifact(path, g_capture_context);
+      g_capture_pid = -1;
+    }
+    if (g_nmap_pid > 0 && waitpid(g_nmap_pid, &status, WNOHANG) == g_nmap_pid) {
+      for (const auto& path : savedArtifactsFromOutput(readTextFile("/tmp/reconclave-nmap.log")))
+        attributeArtifact(path, g_nmap_context);
+      g_nmap_pid = -1;
+    }
+    if (g_screenshot_pid > 0 && waitpid(g_screenshot_pid, &status, WNOHANG) == g_screenshot_pid) {
+      if (WIFEXITED(status) && WEXITSTATUS(status) == 0) attributeArtifact(g_screenshot_path, g_screenshot_context);
+      g_screenshot_pid = -1;
+    }
+    if (g_capture_pid > 0 || g_nmap_pid > 0 || g_screenshot_pid > 0) usleep(100000);
+  }
+  g_evidence_cancel_requested.store(true);
+  if (g_evidence_worker.joinable()) g_evidence_worker.join();
+  if (g_survey_thread.joinable()) g_survey_thread.join();
   if (g_wifi_op_thread.joinable()) g_wifi_op_thread.join();
   return 0;
 }

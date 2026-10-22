@@ -36,7 +36,7 @@ bool resolveHost(const std::string& hostname, DnsResult& result, std::string& er
 // Numeric IPv4 only. Hostname resolution is deliberately a separate tool so
 // signed scopes bind connection jobs to the exact address they authorize.
 bool tcpConnect(const std::string& address, std::uint16_t port, int timeout_ms,
-                TcpObservation& observation);
+                TcpObservation& observation, const std::string& bind_interface = {});
 
 // A single bounded connection. It waits for server-first greetings and sends
 // only a fixed HTTP HEAD request on common cleartext HTTP ports. It never

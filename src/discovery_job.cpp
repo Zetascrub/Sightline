@@ -32,20 +32,23 @@ bool boundedIpv4Range(const std::string& network,std::uint32_t&first,std::uint32
 }
 
 DiscoveryJob::~DiscoveryJob(){cancel();if(thread_.joinable())thread_.join();}
-bool DiscoveryJob::start(const std::string&network,std::string&error){
+bool DiscoveryJob::start(const std::string&network,std::string&error,const std::string&bind_interface){
   std::uint32_t first=0,last=0;if(!boundedIpv4Range(network,first,last,error))return false;
+  if (!bind_interface.empty() && bind_interface != "eth0" && bind_interface != "wlan0") {
+    error = "interface must be eth0 or wlan0"; return false;
+  }
   if(thread_.joinable()){DiscoverySnapshot current=snapshot();if(current.status=="running"){error="a discovery job is already running";return false;}thread_.join();}
   cancel_=false;{std::lock_guard<std::mutex>lock(mutex_);state_={};state_.job_id=makeJobId();state_.status="running";state_.total=last-first+1;}
-  thread_=std::thread(&DiscoveryJob::run,this,first,last);return true;
+  thread_=std::thread(&DiscoveryJob::run,this,first,last,bind_interface);return true;
 }
 void DiscoveryJob::cancel(){cancel_=true;}
 DiscoverySnapshot DiscoveryJob::snapshot()const{std::lock_guard<std::mutex>lock(mutex_);return state_;}
-void DiscoveryJob::run(std::uint32_t first,std::uint32_t last){
+void DiscoveryJob::run(std::uint32_t first,std::uint32_t last,std::string bind_interface){
   const std::vector<std::uint16_t>& ports = knownServicePorts();
   std::atomic<std::uint32_t>next{first};std::vector<std::thread>workers;
   for(unsigned worker=0;worker<kWorkers;++worker)workers.emplace_back([&,last]{
     while(!cancel_){const std::uint32_t value=next.fetch_add(1);if(value>last)break;DiscoveredHost host;host.address=addressText(value);
-      for(auto port:ports){if(cancel_)break;TcpObservation observation;if(tcpConnect(host.address,port,kConnectTimeoutMs,observation))host.open_ports.push_back(port);}
+      for(auto port:ports){if(cancel_)break;TcpObservation observation;if(tcpConnect(host.address,port,kConnectTimeoutMs,observation,bind_interface))host.open_ports.push_back(port);}
       std::lock_guard<std::mutex>lock(mutex_);++state_.checked;if(!host.open_ports.empty())state_.hosts.push_back(std::move(host));
     }});
   for (auto& worker : workers) worker.join();

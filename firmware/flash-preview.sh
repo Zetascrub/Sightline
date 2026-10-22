@@ -36,6 +36,7 @@ install -d -m 0700 "$BACKUP_DIR"
 backup="$BACKUP_DIR/k230-reconclave-preview-backup-$stamp.tar.gz"
 paths=()
 for path in \
+	etc/init.d/S50telnet \
 	etc/init.d/S90reconclave \
 	etc/init.d/S90reconclave-node \
 	etc/init.d/S99reconclave-ui \
@@ -48,6 +49,10 @@ for path in \
 	usr/sbin/reconclave-capture \
 	usr/sbin/reconclave-screenshot \
 	usr/sbin/reconclave-nmap \
+	usr/sbin/reconclave-enumerate \
+	usr/sbin/reconclave-mission \
+	usr/sbin/reconclave-passive \
+	usr/sbin/reconclave-capabilities \
 	usr/sbin/reconclave-trust \
 	usr/sbin/reconclave-status \
 	usr/sbin/reconclave-ui; do
@@ -61,6 +66,8 @@ fi
 
 install -D -m 0755 "$NODE" "$ROOTFS/usr/bin/reconclave-k230-node"
 install -D -m 0755 "$UI" "$ROOTFS/usr/bin/reconclave-k230-ui"
+install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/etc/init.d/S50telnet" \
+	"$ROOTFS/etc/init.d/S50telnet"
 install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/etc/init.d/S90reconclave-node" \
 	"$ROOTFS/etc/init.d/S90reconclave-node"
 install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/etc/init.d/S99reconclave-ui" \
@@ -73,6 +80,14 @@ install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-screenshot" \
 	"$ROOTFS/usr/sbin/reconclave-screenshot"
 install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-nmap" \
 	"$ROOTFS/usr/sbin/reconclave-nmap"
+install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-enumerate" \
+	"$ROOTFS/usr/sbin/reconclave-enumerate"
+install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-mission" \
+	"$ROOTFS/usr/sbin/reconclave-mission"
+install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-passive" \
+	"$ROOTFS/usr/sbin/reconclave-passive"
+install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-capabilities" \
+	"$ROOTFS/usr/sbin/reconclave-capabilities"
 install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-status" \
 	"$ROOTFS/usr/sbin/reconclave-status"
 install -D -m 0755 "$SCRIPT_DIR/rootfs-overlay/usr/sbin/reconclave-ui" \

@@ -1,41 +1,64 @@
 #!/bin/sh
 set -eu
-
 iface=${1:-}
 duration=${2:-30}
 preset=${3:-all}
-evidence_dir=/root/reconclave/evidence
-
+evidence_dir=${RECONCLAVE_EVIDENCE_DIR:-/root/reconclave/evidence}
 case "$iface" in
-	''|*[!A-Za-z0-9_.:-]*) echo "Usage: reconclave-capture INTERFACE [1-300] [all|arp|dns|dhcp]" >&2; exit 2 ;;
+  ''|*[!A-Za-z0-9_.:-]*) echo 'Usage: reconclave-capture INTERFACE [1-300] [all|arp|dns|dhcp|passive]' >&2; exit 2 ;;
 esac
 [ -d "/sys/class/net/$iface" ] || { echo "Unknown interface: $iface" >&2; exit 2; }
-case "$duration" in ''|*[!0-9]*) echo "Duration must be 1-300 seconds" >&2; exit 2;; esac
-[ "$duration" -ge 1 ] && [ "$duration" -le 300 ] || { echo "Duration must be 1-300 seconds" >&2; exit 2; }
-
+case "$duration" in ''|*[!0-9]*) echo 'Duration must be 1-300 seconds' >&2; exit 2;; esac
+[ "$duration" -ge 1 ] && [ "$duration" -le 300 ] || { echo 'Duration must be 1-300 seconds' >&2; exit 2; }
+snaplen=262144
 case "$preset" in
-	all) set -- ;;
-	arp) set -- arp ;;
-	dns) set -- port 53 ;;
-	dhcp) set -- port 67 or port 68 ;;
-	*) echo "Preset must be all, arp, dns or dhcp" >&2; exit 2 ;;
+  all) set -- ;;
+  arp) set -- arp ;;
+  dns) set -- port 53 ;;
+  dhcp) set -- port 67 or port 68 ;;
+  passive) snaplen=512; set -- -c 5000 arp or '(' udp and '(' port 53 or port 5353 or port 5355 or port 137 or port 67 or port 68 ')' ')' or '(' ip and '(' ether broadcast or ether multicast ')' ')' ;;
+  *) echo 'Preset must be all, arp, dns, dhcp or passive' >&2; exit 2 ;;
 esac
-
-command -v tcpdump >/dev/null 2>&1 || { echo "tcpdump is not installed in this image" >&2; exit 127; }
+command -v tcpdump >/dev/null 2>&1 || { echo 'tcpdump is not installed in this image' >&2; exit 127; }
+umask 077
 mkdir -p "$evidence_dir"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-final="$evidence_dir/capture-${iface}-${preset}-${stamp}.pcap"
+final="$evidence_dir/capture-${iface}-${preset}-${stamp}-$$.pcap"
 partial="${final}.partial"
-umask 077
-tcpdump -i "$iface" -U -s 262144 -w "$partial" "$@" >/dev/null 2>&1 &
+tcpdump -i "$iface" -U -s "$snaplen" -w "$partial" "$@" &
 pid=$!
+stopped=0
+forced=0
+trap 'stopped=1' INT TERM
 cleanup() {
-	kill -INT "$pid" 2>/dev/null || true
-	wait "$pid" 2>/dev/null || true
+  kill -INT "$pid" 2>/dev/null || true
+  # Bound shutdown in case the capture process ignores its normal stop signal.
+  tries=0
+  while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 3 ]; do sleep 1; tries=$((tries + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then forced=1; kill -KILL "$pid" 2>/dev/null || true; fi
+  wait "$pid" 2>/dev/null || true
 }
-trap cleanup INT TERM EXIT
-sleep "$duration"
-cleanup
-trap - INT TERM EXIT
+trap cleanup EXIT
+elapsed=0
+while [ "$elapsed" -lt "$duration" ] && [ "$stopped" -eq 0 ] && kill -0 "$pid" 2>/dev/null; do
+  sleep 1 & sleeper=$!
+  wait "$sleeper" || true
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  elapsed=$((elapsed + 1))
+done
+status=0
+if kill -0 "$pid" 2>/dev/null; then
+  cleanup
+else
+  wait "$pid" || status=$?
+fi
+trap - EXIT INT TERM
+if [ "$status" -ne 0 ] || [ "$forced" -ne 0 ] || [ ! -s "$partial" ]; then
+  rm -f "$partial"
+  echo 'Capture failed; no completed artifact was published' >&2
+  exit 1
+fi
 mv "$partial" "$final"
 printf '%s\n' "$final"
+[ "$stopped" -eq 0 ] || exit 130

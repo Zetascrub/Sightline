@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Persistent, explicitly scoped one-pass field assessment."""
+import argparse
+import csv
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+ROOT = Path(os.environ.get("RECONCLAVE_MISSION_DIR", "/root/reconclave/mission"))
+EVIDENCE = Path(os.environ.get("RECONCLAVE_EVIDENCE_DIR", "/root/reconclave/evidence"))
+SESSION = Path(os.environ.get("RECONCLAVE_SESSION_PATH", "/root/reconclave/session.conf"))
+ENUMERATOR = os.environ.get("RECONCLAVE_ENUMERATOR", "reconclave-enumerate")
+ACTIVE = {"starting", "running", "stopping"}
+MIN_START_BYTES = 64 * 1024 * 1024
+MIN_RUN_BYTES = 24 * 1024 * 1024
+child = None
+stopping = False
+
+
+def locked():
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+    handle = (ROOT / "lock").open("a+")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
+
+
+def read_state():
+    try:
+        return json.loads((ROOT / "state.json").read_text())
+    except (OSError, ValueError):
+        return {"state": "idle"}
+
+
+def write_state(state):
+    state["updated_at"] = int(time.time())
+    path = ROOT / "state.json.tmp"
+    path.write_text(json.dumps(state, sort_keys=True) + "\n")
+    os.chmod(path, 0o600)
+    path.replace(ROOT / "state.json")
+
+
+def alive(state):
+    try:
+        pid = int(state["pid"])
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        return pid > 1 and b"reconclave-mission worker" in command and state["id"].encode() in command
+    except (KeyError, OSError, ValueError):
+        return False
+
+
+def current_state():
+    state = read_state()
+    if state.get("state") in ACTIVE and not alive(state):
+        state["state"] = "interrupted"
+        state["finished_at"] = int(time.time())
+        state["message"] = "Assessment worker stopped; review partial evidence before starting another job."
+        write_state(state)
+    return state
+
+
+def attached(scope, interface):
+    result = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", interface],
+                            text=True, capture_output=True, timeout=5)
+    if result.returncode:
+        raise ValueError(f"Interface {interface} has no IPv4 address")
+    for address in re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", result.stdout):
+        item = ipaddress.ip_interface(address)
+        if item.ip in scope and scope.subnet_of(item.network):
+            return str(item.ip)
+    raise ValueError(f"Scope {scope} is not attached to {interface}")
+
+
+def available_bytes(path):
+    usage = os.statvfs(path)
+    return usage.f_bavail * usage.f_frsize
+
+
+def link_marker(interface):
+    """Capture link properties that must remain stable during a mission."""
+    carrier = Path(f"/sys/class/net/{interface}/carrier")
+    try:
+        if carrier.read_text().strip() != "1":
+            raise ValueError(f"{interface} has no carrier")
+    except FileNotFoundError:
+        pass
+    changes = Path(f"/sys/class/net/{interface}/carrier_changes")
+    try:
+        generation = changes.read_text().strip()
+    except FileNotFoundError:
+        generation = ""
+    bssid = ""
+    if interface == "wlan0":
+        try:
+            response = subprocess.run(["iw", "dev", interface, "link"], capture_output=True,
+                                      text=True, timeout=3)
+            match = re.search(r"Connected to\s+([0-9a-fA-F:]{17})", response.stdout)
+            if response.returncode == 0 and match:
+                bssid = match.group(1).lower()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not bssid:
+            try:
+                response = subprocess.run(["iwconfig", interface], capture_output=True, text=True, timeout=3)
+                match = re.search(r"Access Point:\s*([0-9a-fA-F:]{17})", response.stdout)
+                if response.returncode == 0 and match:
+                    bssid = match.group(1).lower()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return generation + "/" + bssid
+
+
+def summary_metrics(path):
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return {}
+    keys = {
+        "Outcome": "outcome",
+        "Responding hosts in discovery": "responding_hosts",
+        "Hosts observed before active scanning": "passive_hosts",
+        "Hosts with open TCP ports": "hosts_with_open_tcp",
+        "Service ports checked": "service_ports_checked",
+        "Service ports skipped by safety/time limits": "service_ports_skipped",
+        "Read-only protocol checks completed": "protocol_checks",
+        "Protocol checks skipped": "protocol_checks_skipped",
+        "Native NSE host checks completed": "nse_hosts_checked",
+        "NSE host checks skipped": "nse_hosts_skipped",
+        "Full TCP host checks completed": "deep_hosts_checked",
+        "Full TCP host checks skipped": "deep_hosts_skipped",
+        "Additional TCP ports found in deep pass": "deep_new_ports",
+    }
+    metrics = {}
+    for line in lines:
+        label, separator, value = line.partition(": ")
+        if separator and label in keys:
+            metrics[keys[label]] = value.strip() if label == "Outcome" else int(value) if value.isdecimal() else 0
+    return metrics
+
+
+def context():
+    values = {"project_id": "UNASSIGNED", "engagement_id": "UNASSIGNED", "operator_id": "LOCAL"}
+    try:
+        for line in SESSION.read_text().splitlines():
+            key, separator, value = line.partition("=")
+            field = {"project": "project_id", "engagement": "engagement_id", "operator": "operator_id"}.get(key)
+            if separator and field and value:
+                values[field] = value[:48]
+    except OSError:
+        pass
+    return values
+
+
+def attribute(path, values):
+    artifact = Path(path)
+    try:
+        if artifact.parent.resolve() != EVIDENCE.resolve() or not artifact.is_file():
+            return
+        info = artifact.stat()
+        metadata = artifact.parent / ".metadata"
+        metadata.mkdir(mode=0o700, exist_ok=True)
+        version = f"{info.st_size}:{info.st_mtime_ns // 1000000000}:{info.st_mtime_ns % 1000000000}:{info.st_ino}"
+        target = metadata / (artifact.name + ".json")
+        temporary = metadata / (artifact.name + f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({"file_version": version, "context": values}))
+        os.chmod(temporary, 0o600)
+        temporary.replace(target)
+    except OSError:
+        pass
+
+
+def build_field_report(state):
+    """Portable, self-checking handoff; origin is not cryptographically asserted."""
+    summary = Path(state.get("summary", ""))
+    if not summary.is_file() or summary.resolve().parent != EVIDENCE.resolve():
+        return ""
+    summary_text = summary.read_text(errors="replace")
+    if len(summary_text.encode()) > 512 * 1024:
+        return ""
+    hosts = []
+    host_map = {}
+    current = None
+    files = [summary]
+    in_evidence = False
+    in_responding = False
+    in_deep = False
+    initial_coverage = ("top-1000-at-most" if
+                        "Expanded TCP stage completed: yes" in summary_text.splitlines()
+                        else "top-100-at-most")
+    for line in summary_text.splitlines():
+        if line == "Responding hosts:":
+            in_responding = True
+            in_deep = False
+            continue
+        if line == "Deep TCP coverage:":
+            in_deep = True
+            in_responding = False
+            continue
+        if line == "Observed hosts and services:":
+            in_responding = False
+        if in_responding and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", line):
+            host_map.setdefault(line, {"address": line, "open_ports": [],
+                                       "tcp_coverage": initial_coverage})
+        if in_deep:
+            deep_match = re.match(r"^(\d+\.\d+\.\d+\.\d+): complete;", line)
+            if deep_match:
+                host_map.setdefault(deep_match.group(1), {"address": deep_match.group(1),
+                                     "open_ports": [], "tcp_coverage": "all-65535"})["tcp_coverage"] = "all-65535"
+        match = re.match(r"^(\d+\.\d+\.\d+\.\d+): open TCP (.*)$", line)
+        if match:
+            current = host_map.setdefault(match.group(1), {"address": match.group(1), "open_ports": [],
+                                           "tcp_coverage": initial_coverage})
+            current["open_ports"] = [int(port) for port in
+                                     re.findall(r"\b\d+\b", match.group(2)) if 1 <= int(port) <= 65535]
+        elif current and line.startswith("  TCP coverage: "):
+            current["tcp_coverage"] = ("all-65535" if "all 65535" in line else
+                                       "top-100-at-most" if "top 100 ports" in line else "top-1000-at-most")
+        elif line == "Evidence:":
+            in_evidence = True
+        elif in_evidence and line.startswith("/"):
+            files.append(Path(line))
+    hosts = [host_map[address] for address in sorted(host_map, key=ipaddress.ip_address)]
+    artifacts = []
+    for path in dict.fromkeys(files):
+        candidates = [path]
+        if path.name.startswith("nmap-") and path.suffix == ".txt":
+            candidates.append(path.with_suffix(".xml"))
+        for artifact in candidates:
+            try:
+                if artifact.resolve().parent != EVIDENCE.resolve() or not artifact.is_file():
+                    continue
+                raw = artifact.read_bytes()
+                artifacts.append({"name": artifact.name, "size": len(raw),
+                                  "sha256": hashlib.sha256(raw).hexdigest()})
+            except OSError:
+                continue
+    report = {"schema": "sightline-field-report/v1", "authentication": "operator-imported-unverified-origin",
+              "mission_id": state["id"], "resumed_from": state.get("resumed_from", ""),
+              "context": state["context"], "scope": state["scope"], "interface": state["interface"],
+              "source_ip": state["source_ip"], "profile": state["profile"],
+              "outcome": state["state"], "started_at": state.get("started_at", 0),
+              "finished_at": state.get("finished_at", 0), "metrics": state.get("metrics", {}),
+              "hosts": hosts, "summary_text": summary_text,
+              "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(), "files": artifacts}
+    target = EVIDENCE / ("field-report-" + state["id"] + ".json")
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(report, sort_keys=True) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(target)
+    attribute(target, state["context"])
+    # Human-readable and spreadsheet handoffs are derived from the same
+    # immutable snapshot as the JSON, so their host coverage cannot drift.
+    def cell(value):
+        return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("|", "\\|").replace("\n", " "))
+
+    markdown = EVIDENCE / ("field-report-" + state["id"] + ".md")
+    lines = ["# Sightline field assessment", "",
+             f"Project: {cell(state['context']['project_id'])}  ",
+             f"Engagement: {cell(state['context']['engagement_id'])}  ",
+             f"Operator: {cell(state['context']['operator_id'])}  ",
+             f"Scope: {cell(state['scope'])} via {cell(state['interface'])} ({cell(state['source_ip'])})  ",
+             f"Profile: {cell(state['profile'])}  ",
+             f"Outcome: {cell(state['state'])}", "",
+             "## Coverage", "",
+             "This report records observed services and scan coverage. It does not establish vulnerabilities.", ""]
+    for key, value in report["metrics"].items():
+        lines.append(f"- {cell(key.replace('_', ' ').capitalize())}: {cell(value)}")
+    lines += ["", "## Observed hosts", "", "| IPv4 | Open TCP ports | TCP coverage |",
+              "| --- | --- | --- |"]
+    for host in hosts:
+        lines.append(f"| {host['address']} | {', '.join(map(str, host['open_ports'])) or 'none observed'} "
+                     f"| {host['tcp_coverage']} |")
+    if not hosts:
+        lines.append("| None observed | — | — |")
+    lines += ["", "## Evidence inventory", "", "| File | Bytes | SHA-256 |",
+              "| --- | ---: | --- |"]
+    for artifact in artifacts:
+        lines.append(f"| {cell(artifact['name'])} | {artifact['size']} | `{artifact['sha256']}` |")
+    lines += ["", "Review the raw Nmap XML, packet captures and protocol output before promoting any observation to a finding.", ""]
+    md_temp = markdown.with_suffix(".md.tmp")
+    md_temp.write_text("\n".join(lines))
+    os.chmod(md_temp, 0o600)
+    md_temp.replace(markdown)
+    attribute(markdown, state["context"])
+    csv_path = EVIDENCE / ("field-report-" + state["id"] + ".csv")
+    csv_temp = csv_path.with_suffix(".csv.tmp")
+    with csv_temp.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("ipv4", "open_tcp_ports", "tcp_coverage", "scope", "interface", "outcome"))
+        for host in hosts:
+            writer.writerow((host["address"], ";".join(map(str, host["open_ports"])),
+                             host["tcp_coverage"], state["scope"], state["interface"], state["state"]))
+    os.chmod(csv_temp, 0o600)
+    csv_temp.replace(csv_path)
+    attribute(csv_path, state["context"])
+    return str(target)
+
+
+def handle_signal(_number, _frame):
+    global stopping
+    stopping = True
+    if child and child.poll() is None:
+        child.terminate()
+
+
+def watch_link(state, done):
+    global stopping
+    scope = ipaddress.ip_network(state["scope"])
+    while not done.wait(2):
+        reason = ""
+        try:
+            if attached(scope, state["interface"]) != state["source_ip"]:
+                reason = "source address changed"
+            elif link_marker(state["interface"]) != state.get("link_marker", ""):
+                reason = "selected link changed"
+            elif available_bytes(EVIDENCE) < MIN_RUN_BYTES:
+                reason = "evidence storage is low"
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            reason = str(exc)[:120]
+        if reason:
+            stopping = True
+            with locked():
+                latest = read_state()
+                if latest.get("id") == state["id"]:
+                    latest["stop_reason"] = reason
+                    latest["stage"] = "Stopping: " + reason
+                    latest["state"] = "stopping"
+                    write_state(latest)
+            if child and child.poll() is None:
+                child.terminate()
+            return
+
+
+def worker(mission_id):
+    global child
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    with locked():
+        state = read_state()
+        if state.get("id") != mission_id or state.get("pid") != os.getpid():
+            return 2
+        state.update(state="running", stage="Starting assessment", started_at=int(time.time()))
+        write_state(state)
+    env = dict(os.environ, RECONCLAVE_SCAN_INTERFACE=state["interface"], RECONCLAVE_EVIDENCE_DIR=str(EVIDENCE),
+               RECONCLAVE_ASSESS_PROFILE=state["profile"], RECONCLAVE_CHECKPOINT=state["checkpoint"])
+    log_path = ROOT / (mission_id + ".log")
+    result = 1
+    done = threading.Event()
+    monitor = None
+    try:
+        with log_path.open("w") as log:
+            if stopping:
+                raise RuntimeError("Assessment stopped before launch")
+            child = subprocess.Popen([ENUMERATOR, state["scope"]], stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+            monitor = threading.Thread(target=watch_link, args=(state, done), daemon=True)
+            monitor.start()
+            for line in child.stdout:
+                log.write(line)
+                log.flush()
+                value = line.strip()
+                with locked():
+                    latest = read_state()
+                    if latest.get("id") != mission_id:
+                        break
+                    if value.startswith("SAVED "):
+                        path = value[6:]
+                        attribute(path, latest["context"])
+                        if path.endswith(".txt"):
+                            xml = str(Path(path).with_suffix(".xml"))
+                            attribute(xml, latest["context"])
+                        latest["latest_evidence"] = path
+                        if Path(path).name.startswith("enumeration-"):
+                            latest["summary"] = path
+                    elif value.startswith(("RUNNING ", "REUSED ", "DONE ", "STAGE ", "PROGRESS ", "FOUND ",
+                                           "PLANNED ", "PROBED ", "ASSESSMENT ")):
+                        latest["stage"] = value[:160]
+                        if value.startswith("ASSESSMENT "):
+                            warning_count = re.search(r"(\d+) warnings$", value)
+                            if warning_count:
+                                latest["warning_count"] = int(warning_count.group(1))
+                    write_state(latest)
+            result = child.wait()
+    except (OSError, ValueError, RuntimeError) as exc:
+        with locked():
+            latest = read_state()
+            latest["message"] = str(exc)[:200]
+            write_state(latest)
+    finally:
+        done.set()
+        if monitor:
+            monitor.join(timeout=3)
+    with locked():
+        latest = read_state()
+        if latest.get("id") == mission_id:
+            if latest.get("summary"):
+                latest["metrics"] = summary_metrics(latest["summary"])
+            latest.update(state="stopped" if stopping or result == 130 else "complete" if result == 0 else "partial",
+                          exit_code=result, finished_at=int(time.time()), pid=0)
+            try:
+                latest["field_report"] = build_field_report(latest)
+                if latest["field_report"]:
+                    latest["field_report_markdown"] = str(Path(latest["field_report"]).with_suffix(".md"))
+                    latest["field_report_csv"] = str(Path(latest["field_report"]).with_suffix(".csv"))
+            except (OSError, ValueError) as exc:
+                latest["report_error"] = str(exc)[:160]
+            write_state(latest)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    start = commands.add_parser("start", help="Arm and start one bounded assessment")
+    start.add_argument("scope")
+    start.add_argument("interface", choices=("eth0", "wlan0"))
+    start.add_argument("--profile", choices=("balanced", "deep"), default="balanced")
+    commands.add_parser("resume", help="Resume the latest stopped or interrupted assessment")
+    commands.add_parser("status")
+    commands.add_parser("stop")
+    hidden = commands.add_parser("worker", help=argparse.SUPPRESS)
+    hidden.add_argument("id")
+    args = parser.parse_args()
+    os.umask(0o077)
+    if args.command == "worker":
+        return worker(args.id)
+    if args.command == "status":
+        with locked():
+            print(json.dumps(current_state(), sort_keys=True))
+        return 0
+    if args.command == "stop":
+        with locked():
+            state = current_state()
+            if state.get("state") not in ACTIVE:
+                print("No assessment is running", file=sys.stderr)
+                return 1
+            state["state"] = "stopping"
+            state["stop_reason"] = "operator requested stop"
+            write_state(state)
+            os.kill(state["pid"], signal.SIGTERM)
+        print("Stop requested")
+        return 0
+    previous = None
+    if args.command == "resume":
+        with locked():
+            previous = current_state()
+            if previous.get("state") not in ("stopped", "partial", "interrupted") or not previous.get("checkpoint"):
+                print("No resumable assessment is available", file=sys.stderr)
+                return 1
+        args.scope = previous["scope"]
+        args.interface = previous["interface"]
+        args.profile = previous["profile"]
+    try:
+        scope = ipaddress.ip_network(args.scope, strict=True)
+        if scope.version != 4 or scope.prefixlen < 24:
+            raise ValueError("Scope must be IPv4 /24 or smaller")
+        source_ip = attached(scope, args.interface)
+        marker = link_marker(args.interface)
+        EVIDENCE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if available_bytes(EVIDENCE) < MIN_START_BYTES:
+            raise ValueError("Need at least 64 MiB free for assessment evidence")
+        session = context()
+        if session["project_id"] == "UNASSIGNED" or session["engagement_id"] == "UNASSIGNED":
+            raise ValueError("Set project and engagement in Session before starting an assessment")
+        if previous and (previous["context"] != session or previous["source_ip"] != source_ip or
+                         previous.get("link_marker") != marker or
+                         not Path(previous["checkpoint"]).is_file()):
+            raise ValueError("Resume requires the same session, source address and link")
+    except (ValueError, subprocess.SubprocessError) as exc:
+        parser.error(str(exc))
+    with locked():
+        existing = current_state()
+        if existing.get("state") in ACTIVE:
+            print("An assessment is already running", file=sys.stderr)
+            return 1
+        if previous and existing.get("id") != previous["id"]:
+            print("Assessment changed while resuming; retry status", file=sys.stderr)
+            return 1
+        mission_id = uuid.uuid4().hex[:16]
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "worker", mission_id],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True, env=os.environ.copy())
+        write_state({"id": mission_id, "state": "starting", "scope": str(scope), "interface": args.interface,
+                     "source_ip": source_ip, "link_marker": marker, "context": session, "pid": process.pid,
+                     "profile": args.profile, "checkpoint": previous["checkpoint"] if previous else
+                     str(ROOT / (mission_id + ".checkpoint.json")),
+                     "resumed_from": previous["id"] if previous else "",
+                     "armed_at": int(time.time()), "stage": "Starting", "log": str(ROOT / (mission_id + ".log"))})
+    print(f"Started {mission_id}: {scope} via {args.interface} ({source_ip})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

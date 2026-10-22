@@ -2,32 +2,104 @@
 set -eu
 target=${1:-}
 preset=${2:-discovery}
-evidence_dir=/root/reconclave/evidence
-case "$target" in ''|*[!0-9./]*) echo "Usage: reconclave-nmap IPv4_OR_CIDR [discovery|quick|services]" >&2; exit 2;; esac
+ports=${3:-}
+iface=${RECONCLAVE_SCAN_INTERFACE:-}
+evidence_dir=${RECONCLAVE_EVIDENCE_DIR:-/root/reconclave/evidence}
+case "$target" in ''|*[!0-9./]*) echo 'Usage: reconclave-nmap IPv4_OR_CIDR [discovery|quick|expanded|udp|services|focused|nse|deep] [ports]' >&2; exit 2;; esac
+case "$target" in
+  */*) prefix=${target##*/}; case "$prefix" in ''|*[!0-9]*) echo 'Invalid CIDR prefix' >&2; exit 2;; esac
+       [ "$prefix" -ge 24 ] && [ "$prefix" -le 32 ] || { echo 'Target network must be /24 or smaller' >&2; exit 2; };;
+esac
+case "$iface" in ''|eth0|wlan0) ;; *) echo 'Scan interface must be eth0 or wlan0' >&2; exit 2;; esac
+source_ip=
+if [ -n "$iface" ]; then
+  source_ip=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk 'NR == 1 {print $4}')
+  source_ip=${source_ip%%/*}
+  [ -n "$source_ip" ] || { echo "No IPv4 address on $iface" >&2; exit 2; }
+  [ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = up ] || { echo "$iface is down" >&2; exit 2; }
+fi
 case "$preset" in
   discovery) set -- -sn -n -T4 --max-retries 1 --host-timeout 8s;;
-  quick) set -- -sT -n -T4 --top-ports 100 --open --max-retries 1 --host-timeout 30s;;
-  services) set -- -sT -sV --version-light -n -T3 --top-ports 50 --open --max-retries 1 --host-timeout 45s;;
-  *) echo "Preset must be discovery, quick or services" >&2; exit 2;;
+  quick) if [ -n "$iface" ]; then mode=-sS; else mode=-sT; fi
+         set -- "$mode" -n -T4 --top-ports 100 --open --max-retries 1 --host-timeout 30s;;
+  expanded) if [ -n "$iface" ]; then mode=-sS; else mode=-sT; fi
+            set -- "$mode" -n -T4 --top-ports 1000 --open --max-retries 0 --host-timeout 35s;;
+  udp) set -- -sU -n -T4 --top-ports 20 --open --max-retries 0 --host-timeout 20s;;
+  services) if [ -n "$iface" ]; then mode=-sS; else mode=-sT; fi
+            set -- "$mode" -sV --version-light -n -T3 --top-ports 50 --open --max-retries 1 --host-timeout 45s;;
+  deep) case "$target" in */*) echo 'Deep scan requires one IPv4 host' >&2; exit 2;; esac
+        [ -z "$ports" ] || { echo 'Deep scan does not accept a port list' >&2; exit 2; }
+        if [ -n "$iface" ]; then mode=-sS; else mode=-sT; fi
+        set -- "$mode" -Pn -n -T3 -p- --open --max-retries 0 --host-timeout 150s;;
+  focused|nse) case "$target" in */*) echo 'Focused/NSE scan requires one IPv4 host' >&2; exit 2;; esac
+           case "$ports" in ''|*[!0-9,]*) echo 'Focused/NSE scan requires numeric comma-separated ports' >&2; exit 2;; esac
+           case "$ports" in ,*|*,|*,,*) echo 'Focused/NSE scan has an empty port' >&2; exit 2;; esac
+           old_ifs=$IFS; IFS=,; set -- $ports; IFS=$old_ifs
+           [ "$#" -le 64 ] || { echo 'Focused/NSE scan allows at most 64 ports' >&2; exit 2; }
+           for port do [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { echo 'Invalid focused/NSE port' >&2; exit 2; }; done
+           if [ -n "$iface" ]; then mode=-sS; else mode=-sT; fi
+           if [ "$preset" = nse ]; then
+             set -- "$mode" -Pn -n -T3 -p "$ports" --open --max-retries 0 --host-timeout 45s \
+               --script-timeout 12s --script 'http-title,http-security-headers,ssl-cert,ssh-hostkey,smb2-security-mode'
+           else
+             set -- "$mode" -sV --version-light -n -T3 -p "$ports" --open --max-retries 1 --host-timeout 45s
+           fi;;
+  *) echo 'Preset must be discovery, quick, expanded, udp, services, focused, nse or deep' >&2; exit 2;;
 esac
-command -v nmap >/dev/null 2>&1 || { echo "nmap is not installed" >&2; exit 127; }
+if [ -n "$iface" ]; then set -- -e "$iface" -S "$source_ip" "$@"; fi
+command -v nmap >/dev/null 2>&1 || { echo 'nmap is not installed' >&2; exit 127; }
+umask 077
 mkdir -p "$evidence_dir"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-output="$evidence_dir/nmap-${preset}-${stamp}.txt"
-umask 077
-printf 'Reconclave Nmap // %s // %s\n\n' "$preset" "$target" | tee "$output"
+output="$evidence_dir/nmap-${preset}-${stamp}-$$.txt"
 raw="${output}.partial"
-nmap "$@" "$target" >"$raw" 2>&1 &
+xml="${output%.txt}.xml"
+nmap "$@" -oX "$xml.partial" "$target" >"$raw" 2>&1 &
 scan_pid=$!
+stopped=0
+trap 'stopped=1' INT TERM
+cleanup() {
+  kill -TERM "$scan_pid" 2>/dev/null || true
+  tries=0
+  while kill -0 "$scan_pid" 2>/dev/null && [ "$tries" -lt 3 ]; do sleep 1; tries=$((tries + 1)); done
+  kill -KILL "$scan_pid" 2>/dev/null || true
+  wait "$scan_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+max_seconds=120
+[ "$preset" = expanded ] && max_seconds=180
+[ "$preset" = deep ] && max_seconds=165
 elapsed=0
-while kill -0 "$scan_pid" 2>/dev/null && [ "$elapsed" -lt 120 ]; do
-  sleep 1
+while kill -0 "$scan_pid" 2>/dev/null && [ "$elapsed" -lt "$max_seconds" ] && [ "$stopped" -eq 0 ]; do
+  sleep 1 & sleeper=$!
+  wait "$sleeper" || true
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
   elapsed=$((elapsed + 1))
 done
-if kill -0 "$scan_pid" 2>/dev/null; then kill -INT "$scan_pid" 2>/dev/null || true; fi
 status=0
-wait "$scan_pid" || status=$?
-cat "$raw" | tee -a "$output"
+if kill -0 "$scan_pid" 2>/dev/null; then
+  cleanup
+  if [ "$stopped" -ne 0 ]; then status=130; else status=124; fi
+else
+  wait "$scan_pid" || status=$?
+  [ "$stopped" -eq 0 ] || status=130
+fi
+trap - EXIT INT TERM
+# Publish one complete report, including explicit unsuccessful/partial status.
+report="${output}.tmp"
+{
+  printf 'Reconclave Nmap // %s // %s\nInterface: %s  Source: %s\nExit status: %s (0 complete, 130 cancelled, 124 timed out)\n\n' "$preset" "$target" "${iface:-kernel route}" "${source_ip:-kernel selected}" "$status"
+  cat "$raw"
+} >"$report"
+mv "$report" "$output"
 rm -f "$raw"
+# A ready marker is published last; the node is the sole database writer.
+if [ -f "$xml.partial" ]; then
+  mv "$xml.partial" "$xml"
+  printf '%s\n' "$status" > "$xml.ready.tmp"
+  mv "$xml.ready.tmp" "$xml.ready"
+fi
+cat "$output"
 printf '\nSAVED %s\n' "$output"
 exit "$status"

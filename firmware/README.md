@@ -44,6 +44,13 @@ The resulting image remains recoverable with the original full-card and raw
 U-Boot-region backups. Flashing is intentionally a separate, explicit operator
 step because it destroys the destination card's current contents.
 
+The current recipe selects Nmap with NSE, `tcpdump`, `curl` with OpenSSL,
+OpenSSL command-line tools, BIND's DNS utilities, `jq`, `socat` and `ethtool`.
+After boot, run `reconclave-capabilities` or `reconclave-capabilities --json` to
+check what the built image actually contains. It reports executable and
+interface presence; monitor mode, frame injection, USB HID gadget and BLE HCI
+remain unverified until tested on this board and image.
+
 ## First boot and networking
 
 Wired Ethernet uses DHCP automatically and is the recovery/initial-setup path.
@@ -75,10 +82,11 @@ complete, the node advertises only its public system and passive ARP
 capabilities; assessment tools remain unavailable by design.
 
 OpenSSH client and server are included. This personal appliance image installs
-the owner's Ed25519 public key(s) and replaces the BSP's unsafe empty-root-
-password configuration with key-only root administration. Password, empty-
-password, keyboard-interactive, agent-forwarding, TCP-forwarding, X11 and
-tunnel access are disabled.
+the owner's Ed25519 public key(s), disables the BSP's network Telnet service,
+and requires key-only SSH for network administration. The stock local root
+account is retained for on-device recovery. SSH password, empty-password,
+keyboard-interactive, agent-forwarding, TCP-forwarding, X11 and tunnel access
+are disabled.
 
 The root `authorized_keys` is **per-deployment key material and is not committed**
 (public-source policy, `tools/check_public_tree.py`, which rejects any `.ssh/`
@@ -95,6 +103,13 @@ authorisation without exposing private key material. Outbound SSH defaults to
 key-only authentication and strict host-key verification.
 
 ## Current validation
+
+The additional BIND-tools, jq and jemalloc selections in this revision have
+been built into a full image and checked with QEMU and filesystem inspection.
+The image has not been flashed or booted as a whole; selected utilities were
+installed and exercised on the running board. See `docs/VALIDATION.md` for
+the precise checks and the outstanding connectivity investigation. The checks
+below describe the earlier image and the paths tested at that time.
 
 - Shell syntax, source staging, init-service modes and splash byte size pass.
 - Both Reconclave K230 binaries build and install through the pinned Buildroot

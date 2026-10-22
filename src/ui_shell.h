@@ -63,13 +63,14 @@ lv_obj_t* createScreen();
 // after creating the group and before building any screens.
 void setKeyboardGroup(lv_group_t* group);
 
-// Builds a small top-left "< back" button on `screen` that switches to
-// `home_screen` when tapped - every non-home screen gets exactly one of
+// Builds a top-left Back button that returns to the launching screen,
+// falling back to `home_screen` - every non-home screen gets exactly one of
 // these, in the same place, so touch-only navigation stays predictable
-// (matches Cardputer's "one rule throughout: ... Q/Escape/Backspace
-// returns to parent" convention, translated to a touch affordance instead
-// of physical keys since this board has none wired up yet).
+// for both touch and the hardware keyboard's Escape action.
 void addBackButton(lv_obj_t* screen, lv_obj_t* home_screen);
+
+// Open a tool and remember its launching screen for the standard Back button.
+void navigateToScreen(lv_obj_t* screen);
 
 // Builds the mascot logo + RECONCLAVE title + connectivity dot status bar
 // strip at the top of `screen`. Content below it should start at

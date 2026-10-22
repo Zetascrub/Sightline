@@ -1,9 +1,11 @@
 #include "ui_shell.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include <map>
 
 #include "../assets/zeta_k230_logo.h"
 
@@ -19,10 +21,12 @@ struct StatusRefs {
   lv_obj_t* clock;
   lv_obj_t* battery;
   lv_obj_t* dot;
+  lv_obj_t* connection;
 };
 
 std::vector<StatusRefs> g_status_bars;
 lv_group_t* g_nav_group = nullptr;
+std::map<lv_obj_t*, lv_obj_t*> g_screen_parents;
 
 // This app never applies an LVGL theme (no lv_theme_default_init()/
 // lv_display_set_theme() call anywhere) - every visual is this app's own
@@ -64,33 +68,44 @@ void ensureFocusStyle() {
 bool isNavigable(lv_obj_t* obj) {
   return lv_obj_has_class(obj, &lv_button_class) ||
          lv_obj_has_class(obj, &lv_textarea_class) ||
-         lv_obj_has_class(obj, &lv_slider_class);
+         lv_obj_has_class(obj, &lv_slider_class) ||
+         lv_obj_has_class(obj, &lv_dropdown_class);
 }
 
-void addFocusableDescendants(lv_group_t* group, lv_obj_t* obj) {
-  const std::uint32_t count = lv_obj_get_child_count(obj);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    lv_obj_t* child = lv_obj_get_child(obj, static_cast<std::int32_t>(i));
-    if (isNavigable(child)) {
-      lv_group_add_obj(group, child);
-      ensureFocusStyle();
-      lv_obj_add_style(child, &g_focus_style, LV_STATE_FOCUSED);
-    }
-    addFocusableDescendants(group, child);
-  }
+void collectFocusable(lv_obj_t* obj, std::vector<lv_obj_t*>& items) {
+  if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) || lv_obj_has_state(obj, LV_STATE_DISABLED)) return;
+  if (isNavigable(obj)) items.push_back(obj);
+  for (std::uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i)
+    collectFocusable(lv_obj_get_child(obj, static_cast<std::int32_t>(i)), items);
 }
 
-void onScreenLoaded(lv_event_t* event) {
-  if (g_nav_group == nullptr) return;
-  // Clears the *group's* membership list, not the screens or widgets
-  // themselves - safe to call on every navigation, and is what actually
-  // confines arrow-key/next-key focus movement to the screen now visible.
+void syncKeyboardFocus(lv_timer_t*) {
+  if (g_nav_group == nullptr || lv_screen_active() == nullptr) return;
+  std::vector<lv_obj_t*> items;
+  collectFocusable(lv_screen_active(), items);
+  bool changed = items.size() != lv_group_get_obj_count(g_nav_group);
+  for (std::size_t i = 0; !changed && i < items.size(); ++i)
+    changed = items[i] != lv_group_get_obj_by_index(g_nav_group, i);
+  if (!changed) return;
+  lv_obj_t* focused = lv_group_get_focused(g_nav_group);
   lv_group_remove_all_objs(g_nav_group);
-  addFocusableDescendants(g_nav_group, static_cast<lv_obj_t*>(lv_event_get_target(event)));
+  ensureFocusStyle();
+  for (auto* item : items) {
+    lv_obj_remove_style(item, &g_focus_style, LV_STATE_FOCUSED);
+    lv_obj_add_style(item, &g_focus_style, LV_STATE_FOCUSED);
+    lv_group_add_obj(g_nav_group, item);
+  }
+  if (std::find(items.begin(), items.end(), focused) != items.end()) lv_group_focus_obj(focused);
 }
+
+void onScreenLoaded(lv_event_t*) { syncKeyboardFocus(nullptr); }
 }  // namespace
 
-void setKeyboardGroup(lv_group_t* group) { g_nav_group = group; }
+void setKeyboardGroup(lv_group_t* group) {
+  g_nav_group = group;
+  // Dynamic result lists can change while their screen is already visible.
+  lv_timer_create(syncKeyboardFocus, 100, nullptr);
+}
 
 lv_obj_t* createScreen() {
   lv_obj_t* screen = lv_obj_create(nullptr);
@@ -101,9 +116,15 @@ lv_obj_t* createScreen() {
   return screen;
 }
 
+void navigateToScreen(lv_obj_t* screen) {
+  if (screen == lv_screen_active()) return;
+  g_screen_parents[screen] = lv_screen_active();
+  lv_screen_load(screen);
+}
+
 void addBackButton(lv_obj_t* screen, lv_obj_t* home_screen) {
   lv_obj_t* button = lv_button_create(screen);
-  lv_obj_set_size(button, 84, kBackButtonHeight);
+  lv_obj_set_size(button, 96, kBackButtonHeight);
   lv_obj_align(button, LV_ALIGN_TOP_LEFT, kSafeMargin, kSafeMargin + kStatusBarHeight + 8);
   lv_obj_set_style_bg_color(button, lv_color_hex(kColorPanelLight), 0);
   lv_obj_set_style_border_color(button, lv_color_hex(kColorAccent), 0);
@@ -115,12 +136,13 @@ void addBackButton(lv_obj_t* screen, lv_obj_t* home_screen) {
       button,
       [](lv_event_t* event) {
         auto* target = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
-        lv_screen_load(target);
+        const auto parent = g_screen_parents.find(lv_screen_active());
+        lv_screen_load(parent != g_screen_parents.end() ? parent->second : target);
       },
       LV_EVENT_CLICKED, home_screen);
 
   lv_obj_t* label = lv_label_create(button);
-  lv_label_set_text(label, LV_SYMBOL_LEFT " back");
+  lv_label_set_text(label, LV_SYMBOL_LEFT " Back");
   lv_obj_set_style_text_color(label, lv_color_hex(kColorAccent), 0);
   lv_obj_center(label);
 }
@@ -153,31 +175,39 @@ void addStatusBar(lv_obj_t* screen, const char* title, bool connected) {
   lv_label_set_text(label, title);
   lv_obj_set_style_text_color(label, lv_color_hex(kColorForeground), 0);
   lv_obj_set_style_text_font(label, &lv_font_montserrat_22, 0);
-  lv_obj_align(label, LV_ALIGN_LEFT_MID, 44, 0);
+  lv_obj_align(label, LV_ALIGN_LEFT_MID, 52, 0);
 
   lv_obj_t* clock = lv_label_create(bar);
   lv_label_set_text(clock, "--:--");
   lv_obj_set_style_text_color(clock, lv_color_hex(kColorSecondary), 0);
   lv_obj_set_style_text_font(clock, &lv_font_montserrat_16, 0);
-  lv_obj_align(clock, LV_ALIGN_RIGHT_MID, -118, 0);
+  lv_obj_align(clock, LV_ALIGN_RIGHT_MID, -230, 0);
 
   lv_obj_t* battery = lv_label_create(bar);
   lv_label_set_text(battery, "--%");
   lv_obj_set_style_text_color(battery, lv_color_hex(kColorForeground), 0);
   lv_obj_set_style_text_font(battery, &lv_font_montserrat_16, 0);
-  lv_obj_align(battery, LV_ALIGN_RIGHT_MID, -48, 0);
+  lv_obj_align(battery, LV_ALIGN_RIGHT_MID, -130, 0);
 
   lv_obj_t* dot = lv_obj_create(bar);
   lv_obj_set_size(dot, 14, 14);
   lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_border_width(dot, 0, 0);
   lv_obj_set_style_bg_color(dot, lv_color_hex(connected ? kColorAccent : kColorUnavailable), 0);
-  lv_obj_align(dot, LV_ALIGN_RIGHT_MID, -4, 0);
-  g_status_bars.push_back({clock, battery, dot});
+  lv_obj_align(dot, LV_ALIGN_RIGHT_MID, -102, 0);
+  lv_obj_t* connection = lv_label_create(bar);
+  lv_label_set_text(connection, connected ? "Linked" : "Offline");
+  lv_obj_set_style_text_font(connection, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(connection, lv_color_hex(kColorSecondary), 0);
+  lv_obj_align(connection, LV_ALIGN_RIGHT_MID, -8, 0);
+  lv_obj_set_width(label, display_width - 450);
+  lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+  g_status_bars.push_back({clock, battery, dot, connection});
 }
 
 void updateStatusBars(const char* clock_text, const char* battery_text, bool connected) {
   for (const auto& refs : g_status_bars) {
+    lv_label_set_text(refs.connection, connected ? "Linked" : "Offline");
     lv_label_set_text(refs.clock, clock_text);
     lv_label_set_text(refs.battery, battery_text);
     lv_obj_set_style_bg_color(
@@ -227,7 +257,7 @@ lv_obj_t* createTile(lv_obj_t* grid, const char* label_text, TileState state,
   lv_coord_t tile_w = tile_size->w;
   lv_coord_t tile_h = tile_size->h;
 
-  lv_obj_t* tile = lv_obj_create(grid);
+  lv_obj_t* tile = lv_button_create(grid);
   lv_obj_set_size(tile, tile_w, tile_h);
   // Root cause of a real bug (see README's Home screen section): without
   // this, the tile inherits a large default theme padding that every
@@ -288,6 +318,7 @@ lv_obj_t* createTile(lv_obj_t* grid, const char* label_text, TileState state,
   }
 
   if (state != TileState::Live) {
+    lv_obj_add_state(tile, LV_STATE_DISABLED);
     lv_obj_t* sub = lv_label_create(tile);
     lv_label_set_text(sub, "not available");
     lv_obj_set_style_text_color(sub, lv_color_hex(kColorSecondary), 0);

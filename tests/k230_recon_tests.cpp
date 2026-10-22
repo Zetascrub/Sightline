@@ -17,6 +17,7 @@
 #include "discovery_job.h"
 #include "evidence_store.h"
 #include "host_knowledge.h"
+#include "asset_view.h"
 
 namespace {
 
@@ -32,6 +33,32 @@ void expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
+  {
+    reconclave::HostRecord a, b, c;
+    a.address = "192.0.2.10"; a.mac = "AA:BB:CC:DD:EE:FF"; a.last_seen_ms = 300;
+    b.address = "192.0.2.2"; b.open_ports = {443}; b.last_seen_ms = 200;
+    c.address = "192.0.2.3"; c.changes = 1; c.last_seen_ms = 100;
+    c.services.push_back({6379, "redis", "Valkey", "Review access", 100});
+    const std::vector<reconclave::HostRecord> hosts{a,b,c};
+    const auto all = reconclave::selectAssets(hosts, "", reconclave::AssetFilter::All, reconclave::AssetSort::Address);
+    expect(all.size() == 3 && all.front().address == b.address, "asset addresses sort numerically");
+    const auto review = reconclave::selectAssets(hosts, "", reconclave::AssetFilter::Review, reconclave::AssetSort::Recent);
+    expect(review.size() == 1 && review[0].address == c.address, "review includes observed changes");
+    expect(reconclave::selectAssets(hosts, "VALKEY", reconclave::AssetFilter::Services, reconclave::AssetSort::Address).size() == 1,
+           "search matches software case-insensitively and includes service-only ports");
+    expect(reconclave::selectAssets(hosts, "aa:bb", reconclave::AssetFilter::All, reconclave::AssetSort::Address).size() == 1,
+           "asset search matches MAC");
+    expect(reconclave::selectAssets(hosts, "443", reconclave::AssetFilter::Review, reconclave::AssetSort::Address).empty(),
+           "search and filter combine");
+    expect(reconclave::selectAssets(hosts, "", reconclave::AssetFilter::Unidentified, reconclave::AssetSort::Address).size() == 2,
+           "unidentified includes ports lacking service identification");
+    expect(reconclave::assetPorts(c) == std::vector<std::uint16_t>{6379}, "service observations contribute to port inventory");
+    expect(reconclave::selectAssets(hosts, "", reconclave::AssetFilter::All, reconclave::AssetSort::Recent)[0].address == a.address,
+           "recent sort uses observation timestamps");
+    expect(reconclave::selectAssets({}, "", reconclave::AssetFilter::All, reconclave::AssetSort::Address).empty(),
+           "empty inventory is handled");
+  }
+
   const std::string fixture = "/tmp/reconclave-k230-arp-test.txt";
   {
     std::ofstream out(fixture);
@@ -101,6 +128,16 @@ int main() {
   unordered.set("a", reconclave::json::Value::makeBool(true));
   expect(reconclave::json::canonicalStringify(unordered, "tag") == "{\"a\":true,\"z\":1}",
          "canonical JSON sorts keys and omits signature tag");
+
+  // The evidence verifier re-hashes the parsed object, so bytes smuggled
+  // after a record's closing brace must not parse as a clean value - that
+  // would let a timeline record be edited without failing the hash chain.
+  reconclave::json::Value parsed_value;
+  std::string parse_error;
+  expect(!reconclave::json::parse("{\"a\":1} trailing", parsed_value, parse_error),
+         "trailing data after a value is rejected");
+  expect(reconclave::json::parse("{\"a\":1}\n", parsed_value, parse_error),
+         "a value followed only by whitespace still parses");
 
   reconclave::TrustPolicy policy("rc-k230-test");
   policy.setExecutionKeyForTest(key);
@@ -185,6 +222,8 @@ int main() {
   reconclave::DiscoveryJob discovery;
   expect(reconclave::boundedIpv4Range("127.0.0.1/32", first, last, error) && first == last,
          "single-host discovery range accepted");
+  expect(!discovery.start("127.0.0.1/32", error, "unexpected0"),
+         "local discovery rejects unknown scan interfaces");
   expect(discovery.start("127.0.0.1/32", error), "discovery job starts");
   for (int i = 0; i < 100 && discovery.snapshot().status == "running"; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));

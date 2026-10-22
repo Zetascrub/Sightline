@@ -26,12 +26,13 @@ struct DiscoverySnapshot {
 class DiscoveryJob {
  public:
   ~DiscoveryJob();
-  bool start(const std::string& network, std::string& error);
+  bool start(const std::string& network, std::string& error,
+             const std::string& bind_interface = {});
   void cancel();
   DiscoverySnapshot snapshot() const;
 
  private:
-  void run(std::uint32_t first, std::uint32_t last);
+  void run(std::uint32_t first, std::uint32_t last, std::string bind_interface);
   mutable std::mutex mutex_;
   std::thread thread_;
   std::atomic<bool> cancel_{false};

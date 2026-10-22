@@ -5,6 +5,11 @@ add_subdirectory(shared/protocol)
 add_subdirectory(shared/identity)
 
 include(CTest)
+add_library(sightline_xml STATIC third_party/tinyxml2/tinyxml2.cpp)
+target_compile_features(sightline_xml PUBLIC cxx_std_17)
+add_library(sightline_nmap STATIC src/nmap_import.cpp)
+target_link_libraries(sightline_nmap PUBLIC sightline_xml)
+target_compile_features(sightline_nmap PUBLIC cxx_std_17)
 
 # The project() call initially declares LANGUAGES CXX; third_party/lvgl_drm_rotate/
 # lv_linux_drm.c (below, in the UI target) is plain C, so CMake needs this to
@@ -24,6 +29,8 @@ endif()
 
 add_executable(reconclave_k230
   main.cpp
+  src/nmap_queue.cpp
+  src/passive_queue.cpp
   src/json.cpp
   src/http_server.cpp
   src/mdns_responder.cpp
@@ -37,20 +44,43 @@ add_executable(reconclave_k230
   src/host_knowledge.cpp
 )
 
-target_link_libraries(reconclave_k230 PRIVATE reconclave_protocol pthread)
+target_link_libraries(reconclave_k230 PRIVATE reconclave_protocol pthread sightline_nmap)
 target_include_directories(reconclave_k230 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(BUILD_TESTING)
+  add_executable(sightline_nmap_tests tests/nmap_import_tests.cpp src/host_knowledge.cpp src/json.cpp src/nmap_queue.cpp src/passive_queue.cpp)
+  target_link_libraries(sightline_nmap_tests PRIVATE sightline_nmap)
+  target_include_directories(sightline_nmap_tests PRIVATE src)
+  target_compile_options(sightline_nmap_tests PRIVATE -UNDEBUG -Wall -Wextra -Wpedantic -Werror)
+  add_test(NAME sightline_nmap_tests COMMAND sightline_nmap_tests)
   add_executable(sightline_recon_tests
     tests/k230_recon_tests.cpp
     src/network_inventory.cpp src/wifi_scanner.cpp src/gnss_nmea.cpp
     src/network_tools.cpp src/trust_crypto.cpp src/json.cpp src/trust_policy.cpp
     src/discovery_job.cpp src/evidence_store.cpp src/host_knowledge.cpp)
-  target_link_libraries(sightline_recon_tests PRIVATE pthread)
+  target_link_libraries(sightline_recon_tests PRIVATE pthread sightline_nmap)
   target_include_directories(sightline_recon_tests PRIVATE src)
   target_compile_features(sightline_recon_tests PRIVATE cxx_std_17)
   target_compile_options(sightline_recon_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
   add_test(NAME sightline_recon_tests COMMAND sightline_recon_tests)
+  add_executable(sightline_evidence_tests tests/evidence_browser_tests.cpp
+    src/evidence_browser.cpp src/json.cpp src/trust_crypto.cpp)
+  target_include_directories(sightline_evidence_tests PRIVATE src)
+  target_compile_features(sightline_evidence_tests PRIVATE cxx_std_17)
+  target_compile_options(sightline_evidence_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME sightline_tool_lifecycle_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_lifecycle_tests.py ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME sightline_enumeration_flow_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/enumeration_flow_tests.py ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME sightline_mission_flow_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/mission_flow_tests.py ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME sightline_protocol_probe_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_probe_tests.py ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME sightline_passive_flow_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/passive_flow_tests.py ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME sightline_evidence_tests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_evidence_bundle.py $<TARGET_FILE:sightline_evidence_tests>)
 endif()
 
 # Standalone hardware-verification tool for the TCA8418 keyboard driver -
@@ -133,6 +163,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
     src/json.cpp
     src/trust_crypto.cpp
     src/evidence_store.cpp
+    src/evidence_browser.cpp
     src/host_knowledge.cpp
     src/camera_capture.cpp
     src/tca8418_keyboard.cpp
@@ -153,7 +184,7 @@ if(EXISTS "${K230_DEVICE_SYSROOT}/lib/liblvgl.so")
   # this toolchain emits a libatomic call (__atomic_exchange_1) for
   # std::atomic<bool>::exchange() even with -march=rv64gc's "A" extension
   # enabled - confirmed by the link failing without this.
-  target_link_libraries(reconclave_k230_ui PRIVATE reconclave_identity lvgl lvgl_linux drm gpiod pthread atomic)
+  target_link_libraries(reconclave_k230_ui PRIVATE sightline_nmap reconclave_identity lvgl lvgl_linux drm gpiod pthread atomic)
 else()
   message(STATUS "K230 UI targets skipped: run fetch-device-sysroot.sh first")
 endif()

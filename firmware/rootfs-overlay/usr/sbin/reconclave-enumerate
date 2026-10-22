@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""Bounded, evidence-producing enumeration of one locally attached IPv4 scope."""
+import ipaddress
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+MAX_SECONDS = 900
+MAX_HOSTS = 64
+MAX_PORTS_PER_HOST = 64
+MAX_SERVICE_PROBES = 256
+MAX_PROTOCOL_PROBES = 80
+MAX_NSE_HOSTS = 24
+MAX_NSE_PORTS = 64
+MAX_DEEP_HOSTS = 4
+MAX_DEEP_NEW_PORTS = 16
+PROBE_TIMEOUT = min(3.0, max(0.05, float(os.environ.get("RECONCLAVE_PROBE_TIMEOUT", "2"))))
+active = None
+cancelled = False
+checkpoint = None
+
+
+class Checkpoint:
+    """Reuse only finished evidence from this exact scope, interface and profile."""
+
+    def __init__(self, path, scope, interface, source_ip, profile, evidence):
+        self.path = Path(path)
+        self.evidence = evidence.resolve()
+        identity = {"scope": str(scope), "interface": interface, "source_ip": source_ip, "profile": profile}
+        if self.path.is_file():
+            self.data = json.loads(self.path.read_text())
+            if self.data.get("schema") != "sightline-assessment-checkpoint/v1" or self.data.get("identity") != identity:
+                raise ValueError("Checkpoint belongs to a different scope, interface or profile")
+        else:
+            self.data = {"schema": "sightline-assessment-checkpoint/v1", "identity": identity,
+                         "stages": {}, "protocol": {}, "passive": None}
+            self.save()
+
+    def save(self):
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        temporary.write_text(json.dumps(self.data, sort_keys=True) + "\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.path)
+
+    def checksum(self, path):
+        file = Path(path)
+        if file.resolve().parent != self.evidence or not file.is_file():
+            return ""
+        return hashlib.sha256(file.read_bytes()).hexdigest()
+
+    def stage_key(self, target, preset, ports):
+        return json.dumps([str(target), preset, ports or []], separators=(",", ":"))
+
+    def stage(self, target, preset, ports):
+        item = self.data["stages"].get(self.stage_key(target, preset, ports), {})
+        path = Path(item.get("path", "/nonexistent"))
+        if (self.checksum(path) == item.get("sha256") and item.get("sha256") and
+                self.checksum(path.with_suffix(".xml")) == item.get("xml_sha256") and item.get("xml_sha256")):
+            return path
+        return None
+
+    def record_stage(self, target, preset, ports, path):
+        self.data["stages"][self.stage_key(target, preset, ports)] = {
+            "path": str(path), "sha256": self.checksum(path),
+            "xml_sha256": self.checksum(path.with_suffix(".xml"))}
+        self.save()
+
+    def passive(self):
+        item = self.data.get("passive") or {}
+        paths = [Path(path) for path in item.get("paths", [])]
+        if paths and all(self.checksum(path) == item.get("sha256", {}).get(str(path)) for path in paths):
+            return item
+        return None
+
+    def record_passive(self, count, paths):
+        self.data["passive"] = {"count": count, "paths": [str(path) for path in paths],
+                                "sha256": {str(path): self.checksum(path) for path in paths}}
+        self.save()
+
+    def probe(self, key):
+        return self.data["protocol"].get(key)
+
+    def record_probe(self, key, result):
+        self.data["protocol"][key] = result
+        self.save()
+
+
+def stop(_signum, _frame):
+    global cancelled
+    cancelled = True
+    if active is not None:
+        active.terminate()
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+
+def attached(scope, interface):
+    result = subprocess.run(["ip", "-o", "-4", "addr", "show"], capture_output=True, text=True, check=True)
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] != "inet" or (interface and fields[1] != interface):
+            continue
+        try:
+            local = ipaddress.ip_interface(fields[3]).network
+        except ValueError:
+            continue
+        if scope.subnet_of(local):
+            return str(ipaddress.ip_interface(fields[3]).ip)
+    return None
+
+
+def saved_path(output):
+    matches = re.findall(r"^SAVED (/[^\r\n]+\.txt)$", output, re.MULTILINE)
+    return Path(matches[-1]) if matches else None
+
+
+def passive_stage(scope, deadline, reports):
+    global active
+    cached = checkpoint.passive() if checkpoint else None
+    if cached:
+        reports.extend(Path(path) for path in cached["paths"])
+        print(f"REUSED PASSIVE  {cached['count']} hosts", flush=True)
+        return cached["count"]
+    print(f"RUNNING PASSIVE  {scope}  before active scanning", flush=True)
+    active = subprocess.Popen(["reconclave-passive", str(scope)], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+    try:
+        output, _ = active.communicate(timeout=max(1, min(60, deadline - time.monotonic())))
+        status = active.returncode
+    except subprocess.TimeoutExpired:
+        active.terminate()
+        active.communicate(timeout=5)
+        raise RuntimeError("Passive pre-scan exceeded the time budget")
+    finally:
+        active = None
+    published = []
+    for match in re.findall(r"^SAVED (/[^\r\n]+)$", output, re.MULTILINE):
+        path = Path(match)
+        if path.is_file():
+            reports.append(path)
+            published.append(path)
+            print(f"SAVED {path}", flush=True)
+    if cancelled:
+        raise KeyboardInterrupt
+    if status != 0:
+        raise RuntimeError("Passive pre-scan failed: " + output[-200:])
+    json_paths = [path for path in published if path.suffix == ".json"]
+    if len(json_paths) != 1:
+        raise RuntimeError("Passive pre-scan did not publish host observations")
+    count = len(json.loads(json_paths[0].read_text())["hosts"])
+    if checkpoint:
+        checkpoint.record_passive(count, published)
+    print(f"DONE PASSIVE  {count} hosts observed without probes", flush=True)
+    return count
+
+
+def stage(target, preset, deadline, reports, ports=None):
+    global active
+    cached = checkpoint.stage(target, preset, ports) if checkpoint else None
+    if cached:
+        reports.append(cached)
+        print(f"REUSED {preset.upper()}  {target}  {cached}", flush=True)
+        return cached
+    args = ["reconclave-nmap", str(target), preset]
+    if ports is not None:
+        args.append(",".join(str(port) for port in ports))
+    print(f"RUNNING {preset.upper()}  {target}", flush=True)
+    active = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        output, _ = active.communicate(timeout=max(1, min(185 if preset in ("expanded", "deep") else 125,
+                                                      deadline - time.monotonic())))
+    except subprocess.TimeoutExpired:
+        active.terminate()
+        try:
+            output, _ = active.communicate(timeout=4)
+        except subprocess.TimeoutExpired:
+            active.kill()
+            output, _ = active.communicate()
+        raise RuntimeError(f"{preset} exceeded the assessment time budget")
+    finally:
+        active = None
+    path = saved_path(output)
+    if path:
+        print(f"SAVED {path}", flush=True)
+    if cancelled:
+        raise KeyboardInterrupt
+    if not path or not path.is_file():
+        raise RuntimeError(f"{preset} produced no saved report")
+    reports.append(path)
+    report_text = path.read_text(errors="replace")
+    if f"Exit status: 0 " not in report_text:
+        raise RuntimeError(f"{preset} failed; inspect {path}")
+    if preset in ("focused", "nse", "deep") and "due to host timeout" in report_text:
+        raise RuntimeError(f"{preset} host timed out; inspect {path}")
+    if checkpoint:
+        checkpoint.record_stage(target, preset, ports, path)
+    print(f"DONE {preset.upper()}  {target}", flush=True)
+    return path
+
+
+def open_ports(report, scope):
+    xml = report.with_suffix(".xml")
+    hosts = {}
+    root = ET.parse(xml).getroot()
+    for host in root.findall("host"):
+        address = host.find("./address[@addrtype='ipv4']")
+        if address is None:
+            continue
+        ip = ipaddress.ip_address(address.attrib["addr"])
+        if ip not in scope:
+            continue
+        ports = []
+        for port in host.findall("./ports/port"):
+            if port.attrib.get("protocol") == "tcp" and port.find("./state[@state='open']") is not None:
+                ports.append(int(port.attrib["portid"]))
+        if ports:
+            hosts[str(ip)] = sorted(set(ports))
+    return hosts
+
+
+def udp_ports(report, scope):
+    hosts = {}
+    root = ET.parse(report.with_suffix(".xml")).getroot()
+    for host in root.findall("host"):
+        address = host.find("./address[@addrtype='ipv4']")
+        if address is None:
+            continue
+        ip = ipaddress.ip_address(address.attrib["addr"])
+        if ip not in scope:
+            continue
+        confirmed = []
+        uncertain = []
+        for port in host.findall("./ports/port"):
+            if port.attrib.get("protocol") != "udp":
+                continue
+            state = port.find("state")
+            status = state.attrib.get("state", "") if state is not None else ""
+            if status == "open":
+                confirmed.append(int(port.attrib["portid"]))
+            elif status == "open|filtered":
+                uncertain.append(int(port.attrib["portid"]))
+        if confirmed or uncertain:
+            hosts[str(ip)] = (sorted(set(confirmed)), sorted(set(uncertain)))
+    return hosts
+
+
+def live_count(report, scope):
+    root = ET.parse(report.with_suffix(".xml")).getroot()
+    return sum(1 for host in root.findall("host") if host.find("./status[@state='up']") is not None
+               and any(ipaddress.ip_address(address.attrib["addr"]) in scope
+                       for address in host.findall("./address[@addrtype='ipv4']")))
+
+
+def live_addresses(report, scope):
+    root = ET.parse(report.with_suffix(".xml")).getroot()
+    return sorted({address.attrib["addr"] for host in root.findall("host")
+                   if host.find("./status[@state='up']") is not None
+                   for address in host.findall("./address[@addrtype='ipv4']")
+                   if ipaddress.ip_address(address.attrib["addr"]) in scope}, key=ipaddress.ip_address)
+
+
+def service_notes(report):
+    notes = []
+    root = ET.parse(report.with_suffix(".xml")).getroot()
+    for port in root.findall("./host/ports/port"):
+        if port.find("./state[@state='open']") is None:
+            continue
+        service = port.find("service")
+        details = [service.attrib.get(key, "") for key in ("name", "product", "version")] if service is not None else []
+        label = " ".join("".join(char if char.isprintable() else " " for char in item)[:80]
+                         for item in details if item).strip()
+        if label and service is not None and service.attrib.get("method") == "table":
+            label += " [port-table label only; protocol unverified]"
+        notes.append(f"{port.attrib['portid']}/tcp {label or 'open; service unknown'}")
+    return notes
+
+
+def service_features(report):
+    features = {}
+    root = ET.parse(report.with_suffix(".xml")).getroot()
+    for port in root.findall("./host/ports/port"):
+        if port.attrib.get("protocol") != "tcp" or port.find("./state[@state='open']") is None:
+            continue
+        service = port.find("service")
+        if service is not None:
+            features[int(port.attrib["portid"])] = (service.attrib.get("name", ""), service.attrib.get("tunnel", ""))
+    return features
+
+
+def nse_plan(hosts, features):
+    plan = []
+    for host, ports in hosts.items():
+        selected = []
+        for port in ports:
+            name, tunnel = features.get(host, {}).get(port, ("", ""))
+            if (port in (22, 80, 139, 443, 445, 8000, 8080, 8443, 8888, 9443)
+                    or name == "ssh" or name.startswith("http") or tunnel == "ssl"):
+                selected.append(port)
+        if selected:
+            plan.append((host, selected[:MAX_NSE_PORTS]))
+    return sorted(plan, key=lambda item: (445 not in item[1], ipaddress.ip_address(item[0])))
+
+
+def nse_notes(report):
+    root = ET.parse(report.with_suffix(".xml")).getroot()
+    notes = []
+    for script in root.findall("./host/hostscript/script"):
+        name = clean(script.attrib.get("id", ""), 80)
+        output = clean(script.attrib.get("output", "").replace("\n", " / "), 800)
+        if name and output:
+            notes.append(f"host {name}: {output}")
+    for port in root.findall("./host/ports/port"):
+        location = f"{port.attrib.get('portid', '?')}/{port.attrib.get('protocol', '?')}"
+        for script in port.findall("script"):
+            name = clean(script.attrib.get("id", ""), 80)
+            output = clean(script.attrib.get("output", "").replace("\n", " / "), 800)
+            if name and output:
+                notes.append(f"{location} {name}: {output}")
+    return notes
+
+
+def nse_errors(report):
+    return [clean(line, 240) for line in report.read_text(errors="replace").splitlines()
+            if line.startswith("Bug in ")]
+
+
+def clean(value, limit=160):
+    return "".join(char if char.isprintable() else " " for char in value)[:limit].strip()
+
+
+def bound_socket(kind, interface, source_ip):
+    connection = socket.socket(socket.AF_INET, kind)
+    connection.settimeout(PROBE_TIMEOUT)
+    if interface:
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode() + b"\0")
+        connection.bind((source_ip, 0))
+    return connection
+
+
+def certificate_details(der):
+    """Decode public certificate fields locally; this does not establish trust."""
+    result = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout", "-subject", "-enddate"],
+                            input=der, capture_output=True, timeout=PROBE_TIMEOUT)
+    if result.returncode:
+        return []
+    return [clean(line, 240) for line in result.stdout.decode("utf-8", errors="replace").splitlines()
+            if line.startswith(("subject=", "notAfter="))]
+
+
+def http_probe(host, port, tls, interface, source_ip):
+    connection = bound_socket(socket.SOCK_STREAM, interface, source_ip)
+    try:
+        connection.connect((host, port))
+        metadata = []
+        if tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            connection = context.wrap_socket(connection, server_hostname=host)
+            metadata.append(f"TLS {clean(connection.version() or 'unknown')}")
+            certificate = connection.getpeercert(binary_form=True)
+            if certificate:
+                metadata.append("certificate SHA256 " + hashlib.sha256(certificate).hexdigest())
+                metadata.extend(certificate_details(certificate))
+        connection.sendall(f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Reconclave-Sightline/1\r\nConnection: close\r\n\r\n".encode())
+        response = bytearray()
+        while len(response) < 8192 and b"\r\n\r\n" not in response:
+            chunk = connection.recv(min(2048, 8192 - len(response)))
+            if not chunk:
+                break
+            response.extend(chunk)
+        lines = response.split(b"\r\n")
+        status = clean(lines[0].decode("latin-1", errors="replace")) if lines else ""
+        status = status or "no HTTP response"
+        headers = {}
+        for line in lines[1:]:
+            if b":" in line:
+                key, value = line.split(b":", 1)
+                key = key.decode("latin-1", errors="replace").lower()
+                if key in ("server", "www-authenticate", "allow", "strict-transport-security",
+                           "content-security-policy", "x-frame-options", "x-content-type-options",
+                           "referrer-policy", "permissions-policy"):
+                    headers[key] = clean(value.decode("latin-1", errors="replace"))
+        return "; ".join([*metadata, status, *(f"{key}: {value}" for key, value in headers.items())])
+    finally:
+        connection.close()
+
+
+def ssh_probe(host, port, interface, source_ip):
+    connection = bound_socket(socket.SOCK_STREAM, interface, source_ip)
+    try:
+        connection.connect((host, port))
+        banner = bytearray()
+        while len(banner) < 256 and b"\n" not in banner:
+            chunk = connection.recv(min(64, 256 - len(banner)))
+            if not chunk:
+                break
+            banner.extend(chunk)
+        return clean(banner.split(b"\n", 1)[0].decode("ascii", errors="ignore")) or "no SSH banner"
+    finally:
+        connection.close()
+
+
+def receive_exact(connection, count):
+    data = bytearray()
+    while len(data) < count:
+        chunk = connection.recv(count - len(data))
+        if not chunk:
+            raise ConnectionError("short SMB2 response")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def smb2_probe(host, port, interface, source_ip):
+    """One unauthenticated SMB2 negotiate on direct TCP/445; no share access."""
+    connection = bound_socket(socket.SOCK_STREAM, interface, source_ip)
+    try:
+        connection.connect((host, port))
+        header = bytearray(64)
+        header[:4] = b"\xfeSMB"
+        struct.pack_into("<H", header, 4, 64)
+        struct.pack_into("<H", header, 14, 1)  # One requested credit.
+        dialects = (0x0202, 0x0210, 0x0300, 0x0302)
+        request = struct.pack("<HHHHI16sIHH", 36, len(dialects), 1, 0, 0, os.urandom(16), 0, 0, 0)
+        request += struct.pack("<" + "H" * len(dialects), *dialects)
+        payload = bytes(header) + request
+        connection.sendall(len(payload).to_bytes(4, "big") + payload)
+        length = int.from_bytes(receive_exact(connection, 4), "big")
+        if not 72 <= length <= 65536:
+            return "invalid SMB2 frame length"
+        response = receive_exact(connection, length)
+        if response[:4] != b"\xfeSMB" or struct.unpack_from("<H", response, 4)[0] != 64:
+            return "SMB2 negotiation unconfirmed"
+        status = struct.unpack_from("<I", response, 8)[0]
+        command = struct.unpack_from("<H", response, 12)[0]
+        if status or command != 0 or struct.unpack_from("<H", response, 64)[0] != 65:
+            return f"SMB2 negotiation unsuccessful (status 0x{status:08x})"
+        mode, dialect = struct.unpack_from("<HH", response, 66)
+        names = {0x0202: "2.0.2", 0x0210: "2.1", 0x0300: "3.0", 0x0302: "3.0.2"}
+        signing = "required" if mode & 2 else "enabled, not required" if mode & 1 else "not advertised"
+        return f"SMB {names.get(dialect, f'0x{dialect:04x}')}; signing {signing}"
+    finally:
+        connection.close()
+
+
+def dns_probe(host, scope, interface, source_ip):
+    connection = bound_socket(socket.SOCK_DGRAM, interface, source_ip)
+    try:
+        network = str(scope.network_address).split(".")
+        zone = ".".join(reversed(network[:3])) + ".in-addr.arpa"
+        question = b"".join(bytes([len(part)]) + part.encode("ascii") for part in zone.split(".")) + b"\0"
+        identifier = int.from_bytes(os.urandom(2), "big")
+        packet = struct.pack("!HHHHHH", identifier, 0, 1, 0, 0, 0) + question + struct.pack("!HH", 6, 1)
+        connection.sendto(packet, (host, 53))
+        response, _ = connection.recvfrom(2048)
+        if len(response) < 12 or int.from_bytes(response[:2], "big") != identifier:
+            return "invalid DNS response"
+        flags = int.from_bytes(response[2:4], "big")
+        rcode = {0: "NOERROR", 2: "SERVFAIL", 3: "NXDOMAIN", 5: "REFUSED"}.get(flags & 15, str(flags & 15))
+        return f"reverse-zone SOA query {zone}: {rcode}; authoritative={bool(flags & 0x400)}; answers={int.from_bytes(response[6:8], 'big')}"
+    finally:
+        connection.close()
+
+
+def protocol_probe(host, port, kind, scope, interface, source_ip):
+    try:
+        if kind == "ssh":
+            return ssh_probe(host, port, interface, source_ip)
+        if kind == "dns":
+            return dns_probe(host, scope, interface, source_ip)
+        if kind == "smb2":
+            return smb2_probe(host, port, interface, source_ip)
+        return http_probe(host, port, kind == "https", interface, source_ip)
+    except (OSError, ssl.SSLError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        return f"no response ({clean(type(exc).__name__)})"
+
+
+def probe_plan(hosts, udp_hosts, features):
+    plan = []
+    for host in sorted(set(hosts) | set(udp_hosts), key=ipaddress.ip_address):
+        for port in hosts.get(host, []):
+            name, tunnel = features.get(host, {}).get(port, ("", ""))
+            kind = ""
+            if name == "ssh" or port in (22, 2222):
+                kind = "ssh"
+            elif name.startswith("http") or port in (80, 443, 8000, 8080, 8443, 8888, 9443):
+                kind = "https" if tunnel == "ssl" or port in (443, 8443, 9443) else "http"
+            elif port == 445:
+                kind = "smb2"
+            if kind:
+                plan.append((host, port, kind))
+        if 53 in udp_hosts.get(host, ([], []))[0]:
+            plan.append((host, 53, "dns"))
+    return plan
+
+
+def main():
+    global checkpoint
+    if len(sys.argv) != 2:
+        raise ValueError("Usage: reconclave-enumerate IPv4_OR_CIDR")
+    scope = ipaddress.ip_network(sys.argv[1], strict=False)
+    if scope.version != 4 or scope.prefixlen < 24:
+        raise ValueError("Scope must be IPv4 /24 or smaller")
+    interface = os.environ.get("RECONCLAVE_SCAN_INTERFACE", "")
+    if interface not in ("", "eth0", "wlan0"):
+        raise ValueError("Interface must be eth0 or wlan0")
+    source_ip = attached(scope, interface)
+    if source_ip is None:
+        raise ValueError("Scope is not attached to the selected interface")
+    profile = os.environ.get("RECONCLAVE_ASSESS_PROFILE", "balanced")
+    if profile not in ("balanced", "deep"):
+        raise ValueError("Assessment profile must be balanced or deep")
+    os.umask(0o077)
+    evidence = Path(os.environ.get("RECONCLAVE_EVIDENCE_DIR", "/root/reconclave/evidence"))
+    evidence.mkdir(parents=True, exist_ok=True)
+    os.chmod(evidence, 0o700)
+    checkpoint_path = os.environ.get("RECONCLAVE_CHECKPOINT", "")
+    checkpoint = Checkpoint(checkpoint_path, scope, interface, source_ip, profile, evidence) if checkpoint_path else None
+    started = time.monotonic()
+    deadline = started + (1800 if profile == "deep" else MAX_SECONDS)
+    reports = []
+    outcome = "complete"
+    hosts = {}
+    udp_hosts = {}
+    discovered = 0
+    passive_count = 0
+    details = {}
+    features = {}
+    warnings = []
+    identified = 0
+    skipped = 0
+    focused_hosts = 0
+    protocol_results = []
+    protocol_skipped = 0
+    nse_results = []
+    nse_attempted = 0
+    nse_checked = 0
+    nse_skipped = 0
+    deep_completed = 0
+    deep_skipped = 0
+    deep_new_ports = 0
+    deep_status = {}
+    responding = []
+    expanded_done = False
+    try:
+        try:
+            passive_count = passive_stage(scope, deadline, reports)
+        except Exception as exc:
+            warnings.append("Passive pre-scan: " + clean(str(exc)))
+        discovery = stage(scope, "discovery", deadline, reports)
+        discovered = live_count(discovery, scope)
+        responding = live_addresses(discovery, scope)
+        quick = stage(scope, "quick", deadline, reports)
+        hosts = open_ports(quick, scope)
+        print(f"FOUND {len(hosts)} hosts with open top-100 TCP ports", flush=True)
+        if time.monotonic() < deadline:
+            try:
+                expanded = stage(scope, "expanded", deadline, reports)
+                expanded_done = True
+                for host, ports in open_ports(expanded, scope).items():
+                    hosts[host] = sorted(set(hosts.get(host, [])) | set(ports))
+            except Exception as exc:
+                warnings.append("Expanded TCP scan: " + clean(str(exc)))
+        else:
+            warnings.append("Expanded TCP scan: time budget exhausted")
+        print(f"FOUND {len(hosts)} hosts with open " +
+              ("top-1000" if expanded_done else "top-100") + " TCP ports", flush=True)
+        if time.monotonic() < deadline:
+            try:
+                udp = stage(scope, "udp", deadline, reports)
+                udp_hosts = udp_ports(udp, scope)
+            except Exception as exc:
+                warnings.append("UDP scan: " + clean(str(exc)))
+        else:
+            warnings.append("UDP scan: time budget exhausted")
+        print(f"FOUND {sum(len(item[0]) for item in udp_hosts.values())} confirmed open UDP ports", flush=True)
+        for host, ports in sorted(hosts.items(), key=lambda item: ipaddress.ip_address(item[0])):
+            if cancelled:
+                raise KeyboardInterrupt
+            selected = ports[:min(MAX_PORTS_PER_HOST, MAX_SERVICE_PROBES - identified)]
+            if focused_hosts >= MAX_HOSTS or not selected or time.monotonic() >= deadline:
+                skipped += len(ports)
+                continue
+            skipped += len(ports) - len(selected)
+            try:
+                focused = stage(host, "focused", deadline, reports, selected)
+                details[host] = service_notes(focused)
+                features[host] = service_features(focused)
+                identified += len(selected)
+                focused_hosts += 1
+            except Exception as exc:
+                skipped += len(selected)
+                warnings.append(f"Focused service check {host}: {clean(str(exc))}")
+            print(f"PROGRESS {identified} service ports checked; {skipped} skipped", flush=True)
+        planned = probe_plan(hosts, udp_hosts, features)
+        print(f"PLANNED {len(planned)} read-only HTTP, TLS, SSH, DNS and SMB2 checks", flush=True)
+        for host, port, kind in planned:
+            if cancelled:
+                raise KeyboardInterrupt
+            if len(protocol_results) >= MAX_PROTOCOL_PROBES or time.monotonic() >= deadline:
+                protocol_skipped += 1
+                continue
+            probe_key = f"{host}:{port}/{kind}"
+            result = checkpoint.probe(probe_key) if checkpoint else None
+            if result is None:
+                result = protocol_probe(host, port, kind, scope, interface, source_ip)
+                if checkpoint:
+                    checkpoint.record_probe(probe_key, result)
+            protocol_results.append(f"{host}:{port}/{kind}  {result}")
+            print(f"PROBED {host}:{port}/{kind}  {result}", flush=True)
+        probe_report = evidence / f"service-probes-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}.txt"
+        probe_report.write_text("Reconclave read-only protocol checks\n" +
+                                f"Scope: {scope}\nInterface: {interface or 'automatic route'}\n" +
+                                "HTTP uses HEAD /; redirects are not followed. TLS trust is not asserted. "
+                                "SMB2 checks negotiate only; findings are observations, not vulnerability validation.\n" +
+                                f"Checked: {len(protocol_results)}  Skipped: {protocol_skipped}\n\n" +
+                                "\n".join(protocol_results) + "\n")
+        reports.append(probe_report)
+        print(f"SAVED {probe_report}", flush=True)
+        planned_nse = nse_plan(hosts, features)
+        print(f"PLANNED {len(planned_nse)} native NSE host checks", flush=True)
+        for host, selected in planned_nse:
+            if cancelled:
+                raise KeyboardInterrupt
+            if nse_attempted >= MAX_NSE_HOSTS or time.monotonic() >= deadline:
+                nse_skipped += 1
+                continue
+            nse_attempted += 1
+            try:
+                report = stage(host, "nse", deadline, reports, selected)
+                nse_checked += 1
+                notes = nse_notes(report)
+                nse_results.extend(f"{host}  {note}" for note in notes)
+                warnings.extend(f"Native NSE {host}: {error}" for error in nse_errors(report))
+                print(f"DONE NSE  {host}  {len(notes)} script observations", flush=True)
+            except Exception as exc:
+                nse_skipped += 1
+                warnings.append(f"Native NSE check {host}: {clean(str(exc))}")
+        if profile == "deep":
+            candidates = sorted(responding, key=lambda host: (host not in hosts,
+                                -len(hosts.get(host, [])), ipaddress.ip_address(host)))
+            deep_skipped += max(0, len(candidates) - MAX_DEEP_HOSTS)
+            for host in candidates[:MAX_DEEP_HOSTS]:
+                if cancelled:
+                    raise KeyboardInterrupt
+                if time.monotonic() + 30 >= deadline:
+                    deep_status[host] = "time budget exhausted"
+                    deep_skipped += 1
+                    continue
+                try:
+                    old_ports = set(hosts.get(host, []))
+                    full = stage(host, "deep", deadline, reports)
+                    found = set(open_ports(full, scope).get(host, []))
+                    new_ports = sorted(found - old_ports)
+                    if found:
+                        hosts[host] = sorted(old_ports | found)
+                    deep_completed += 1
+                    deep_new_ports += len(new_ports)
+                    deep_status[host] = f"complete; {len(new_ports)} additional TCP ports"
+                    print(f"PROGRESS DEEP  {deep_completed}/{min(len(candidates), MAX_DEEP_HOSTS)} hosts; "
+                          f"{deep_new_ports} additional ports", flush=True)
+                    if new_ports and time.monotonic() + 15 < deadline:
+                        selected = new_ports[:MAX_DEEP_NEW_PORTS]
+                        try:
+                            focused = stage(host, "focused", deadline, reports, selected)
+                            details.setdefault(host, []).extend(service_notes(focused))
+                            identified += len(selected)
+                        except Exception as exc:
+                            skipped += len(selected)
+                            warnings.append(f"Deep follow-up {host}: {clean(str(exc))}")
+                        skipped += len(new_ports) - len(selected)
+                    else:
+                        skipped += len(new_ports)
+                except Exception as exc:
+                    deep_status[host] = "incomplete"
+                    deep_skipped += 1
+                    warnings.append(f"Deep TCP scan {host}: {clean(str(exc))}")
+    except KeyboardInterrupt:
+        outcome = "cancelled"
+    except Exception as exc:
+        outcome = "partial"
+        print(f"ASSESSMENT ERROR {exc}", flush=True)
+    if outcome == "complete" and (warnings or skipped or protocol_skipped or nse_skipped or deep_skipped):
+        outcome = "partial"
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    summary = evidence / f"enumeration-{stamp}-{os.getpid()}.txt"
+    lines = ["Reconclave staged enumeration", f"Scope: {scope}", f"Interface: {interface or 'automatic route'}",
+             f"Profile: {profile}",
+             f"Outcome: {outcome}", f"Responding hosts in discovery: {discovered}",
+             f"Expanded TCP stage completed: {'yes' if expanded_done else 'no'}",
+             f"Hosts observed before active scanning: {passive_count}",
+             f"Hosts with open TCP ports: {len(hosts)}",
+             f"Service ports checked: {identified}", f"Service ports skipped by safety/time limits: {skipped}",
+             f"Read-only protocol checks completed: {len(protocol_results)}", f"Protocol checks skipped: {protocol_skipped}",
+             f"Native NSE host checks attempted: {nse_attempted}",
+             f"Native NSE host checks completed: {nse_checked}", f"NSE host checks skipped: {nse_skipped}",
+             f"Full TCP host checks completed: {deep_completed}", f"Full TCP host checks skipped: {deep_skipped}",
+             f"Additional TCP ports found in deep pass: {deep_new_ports}",
+             "Coverage: passive pre-scan, discovery, top 100 then top 1000 TCP ports, top 20 UDP ports, light service versions, targeted protocol checks and bounded native NSE" +
+             ("; full TCP on up to four responding hosts" if profile == "deep" else ""),
+             "Limitations: remaining hosts have top-1000 TCP coverage at most; UDP uses top 20; no credentials or vulnerability validation",
+             "Warnings: " + ("; ".join(warnings) if warnings else "none"),
+             "", "Responding hosts:"]
+    lines.extend(responding or ["none observed"])
+    lines.extend(["", "Observed hosts and services:"])
+    for host, ports in sorted(hosts.items(), key=lambda item: ipaddress.ip_address(item[0])):
+        lines.append(f"{host}: open TCP {', '.join(str(port) for port in ports)}")
+        lines.append("  TCP coverage: " + ("all 65535 ports" if host in deep_status and
+                     deep_status[host].startswith("complete") else
+                     "top 1000 ports at most" if expanded_done else "top 100 ports at most"))
+        lines.extend(f"  {note}" for note in details.get(host, []))
+        if host not in details:
+            lines.append("  Focused service check not completed")
+        elif not details[host]:
+            lines.append("  No open service confirmed in focused check")
+        if host in udp_hosts:
+            confirmed, uncertain = udp_hosts[host]
+            if confirmed:
+                lines.append("  UDP confirmed open: " + ", ".join(map(str, confirmed)))
+            if uncertain:
+                lines.append(f"  UDP inconclusive on {len(uncertain)} tested ports; see UDP XML")
+    for host in sorted(set(udp_hosts) - set(hosts), key=ipaddress.ip_address):
+        confirmed, uncertain = udp_hosts[host]
+        lines.append(f"{host}: UDP confirmed open {', '.join(map(str, confirmed)) or 'none'}; {len(uncertain)} inconclusive ports")
+    lines.extend(["", "Protocol checks:"])
+    lines.extend(protocol_results or ["none completed"])
+    lines.extend(["", "Native NSE observations:"])
+    lines.extend(nse_results or ["none returned"])
+    lines.extend(["", "Deep TCP coverage:"])
+    lines.extend(f"{host}: {status}" for host, status in sorted(deep_status.items(), key=lambda item: ipaddress.ip_address(item[0])))
+    if not deep_status:
+        lines.append("not requested" if profile == "balanced" else "no responding host selected")
+    lines.extend(["", "Evidence:"])
+    lines.extend(str(report) for report in reports)
+    summary.write_text("\n".join(lines) + "\n")
+    os.chmod(summary, 0o600)
+    print(f"SAVED {summary}", flush=True)
+    print(f"ASSESSMENT {outcome.upper()}  {len(hosts)} hosts with open ports; "
+          f"{identified} service ports checked; {skipped} service ports skipped; "
+          f"{protocol_skipped} protocol checks skipped; {nse_skipped} NSE hosts skipped; "
+          f"{deep_completed} full TCP hosts; {deep_skipped} full TCP hosts skipped; "
+          f"{len(warnings)} warnings", flush=True)
+    return 0 if outcome == "complete" and skipped == 0 else 130 if outcome == "cancelled" else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        print(f"Assessment setup: {exc}", file=sys.stderr)
+        sys.exit(2)

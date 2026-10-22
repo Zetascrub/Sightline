@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Read-only inventory of the tools and interfaces on this Sightline image."""
+import argparse
+import json
+from pathlib import Path
+import shutil
+
+
+TOOLS = {
+    "assessment": ("nmap", "reconclave-mission", "reconclave-enumerate"),
+    "capture": ("tcpdump", "reconclave-capture", "reconclave-passive"),
+    "protocol": ("curl", "dig", "openssl", "socat"),
+    "evidence": ("jq", "sha256sum", "tar"),
+    "remote": ("ssh", "scp", "sftp"),
+}
+
+
+def snapshot():
+    tools = {family: {name: shutil.which(name) is not None for name in names}
+             for family, names in TOOLS.items()}
+    interfaces = {}
+    for name in ("eth0", "wlan0"):
+        path = Path("/sys/class/net") / name
+        interfaces[name] = {"present": path.exists(),
+                            "up": path.exists() and (path / "operstate").read_text().strip() == "up"}
+    return {
+        "schema": "sightline-capabilities/v1",
+        "tools": tools,
+        "interfaces": interfaces,
+        "hardware": {
+            "drm_display": Path("/dev/dri/card0").exists(),
+            "nrf9151_uart": Path("/dev/ttyS3").exists(),
+            "gnss_status": Path("/run/reconclave/gnss-status").exists(),
+        },
+        "validation": {
+            "wifi_monitor_mode": "unverified",
+            "wifi_frame_injection": "unverified",
+            "usb_hid_gadget": "unverified",
+            "ble_hci": "unverified",
+        },
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="emit a machine-readable snapshot")
+    args = parser.parse_args()
+    report = snapshot()
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+        return
+    print("Sightline capability inventory (presence, not a hardware acceptance test)")
+    for family, names in report["tools"].items():
+        print(f"\n{family.upper()}")
+        for name, present in names.items():
+            print(f"  {name:<23} {'available' if present else 'missing'}")
+    print("\nINTERFACES")
+    for name, state in report["interfaces"].items():
+        print(f"  {name:<23} {'up' if state['up'] else 'present, down' if state['present'] else 'missing'}")
+    print("\nHARDWARE SIGNALS")
+    for name, present in report["hardware"].items():
+        print(f"  {name:<23} {'present' if present else 'not observed'}")
+    print("\nUNVERIFIED RADIO/USB MODES")
+    for name in report["validation"]:
+        print(f"  {name}")
+
+
+if __name__ == "__main__":
+    main()

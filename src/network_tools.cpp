@@ -23,7 +23,8 @@ std::int64_t monotonicMs() {
 }
 
 int connectSocket(const std::string& address, std::uint16_t port, int timeout_ms,
-                  int& latency_ms, std::string& error) {
+                  int& latency_ms, std::string& error,
+                  const std::string& bind_interface = {}) {
   if (port == 0 || timeout_ms < 50 || timeout_ms > 10000) {
     error = "invalid port or timeout";
     return -1;
@@ -38,6 +39,13 @@ int connectSocket(const std::string& address, std::uint16_t port, int timeout_ms
   const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     error = std::strerror(errno);
+    return -1;
+  }
+  if (!bind_interface.empty() &&
+      setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, bind_interface.c_str(),
+                 static_cast<socklen_t>(bind_interface.size() + 1)) != 0) {
+    error = std::strerror(errno);
+    close(fd);
     return -1;
   }
   const int flags = fcntl(fd, F_GETFL, 0);
@@ -170,12 +178,12 @@ bool resolveHost(const std::string& hostname, DnsResult& result, std::string& er
 }
 
 bool tcpConnect(const std::string& address, std::uint16_t port, int timeout_ms,
-                TcpObservation& observation) {
+                TcpObservation& observation, const std::string& bind_interface) {
   observation = TcpObservation{};
   observation.address = address;
   observation.port = port;
   const int fd = connectSocket(address, port, timeout_ms, observation.latency_ms,
-                               observation.error);
+                               observation.error, bind_interface);
   observation.connected = fd >= 0;
   if (fd < 0) return false;
   close(fd);

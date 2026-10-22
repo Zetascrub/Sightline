@@ -1,0 +1,4 @@
+#!/bin/sh
+# The stock K230 image starts a network Telnet login on every interface.
+# Sightline uses key-only SSH for maintenance; do not start Telnet at boot.
+exit 0

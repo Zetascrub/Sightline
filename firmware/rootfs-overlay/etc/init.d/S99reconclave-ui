@@ -26,7 +26,27 @@ start() {
 
 stop() {
 	printf 'Stopping Reconclave UI: '
+	pid=$(cat "$PIDFILE" 2>/dev/null || true)
 	start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON" 2>/dev/null || true
+	case "$pid" in
+		''|*[!0-9]*) ;;
+		*)
+			for _ in 1 2 3 4 5 6 7 8 9 10; do
+				kill -0 "$pid" 2>/dev/null || break
+				sleep 1
+			done
+			if kill -0 "$pid" 2>/dev/null; then
+				case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+					"$DAEMON"|"$DAEMON (deleted)") kill -KILL "$pid" 2>/dev/null || true ;;
+				esac
+				sleep 1
+			fi
+			if kill -0 "$pid" 2>/dev/null; then
+				echo 'still running; refusing to restart'
+				return 1
+			fi
+			;;
+	esac
 	rm -f "$PIDFILE"
 	echo OK
 }
@@ -34,6 +54,6 @@ stop() {
 case "${1:-}" in
 	start) start ;;
 	stop) stop ;;
-	restart|reload) stop; start ;;
+	restart|reload) stop && start ;;
 	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
 esac

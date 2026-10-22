@@ -31,11 +31,11 @@
 #      the overlay's own CMakeLists.txt does at build time, reproduced here.
 #
 # Usage: ./fetch-device-sysroot.sh [device-ssh-host]
-# Default device-ssh-host is root@sightline.local.
+# Default device-ssh-host is root@rc-k230-poc.local.
 
 set -e
 
-DEVICE="${1:-root@sightline.local}"
+DEVICE="${1:-root@rc-k230-poc.local}"
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SYSROOT="$ROOT_DIR/.toolchains/device-sysroot"
 LVGL_SRC="$ROOT_DIR/.toolchains/lvgl-src"
